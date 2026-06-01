@@ -154,13 +154,11 @@ func (b *Broker) iniciarServidor() {
 	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
 	if err != nil {
 		fmt.Printf("[Broker %s] ERRO: certificados TLS não encontrados: %v\n", b.id, err)
-		fmt.Println("  Execute ./gen-certs.sh antes de iniciar.")
 		os.Exit(1)
 	}
 
 	cfg := &tls.Config{Certificates: []tls.Certificate{cert}}
 
-	// Extração segura da porta via split (compatível com qualquer ID)
 	partes := strings.Split(b.endereco, ":")
 	if len(partes) != 2 {
 		fmt.Printf("[Broker %s] ERRO endereço mal formatado: %s\n", b.id, b.endereco)
@@ -186,7 +184,6 @@ func (b *Broker) iniciarServidor() {
 			if b.encerrando {
 				return
 			}
-			fmt.Printf("[Broker %s] Erro ao aceitar conexão: %v\n", b.id, err)
 			continue
 		}
 		go b.handleConexao(conn)
@@ -270,36 +267,48 @@ func (b *Broker) handleConexao(conn net.Conn) {
 		return
 	}
 
-	var info protocol.InfoConexao
-	json.Unmarshal([]byte(msg.Payload), &info)
+	if msg.Tipo == protocol.TipoHandshake {
+		var info protocol.InfoConexao
+		json.Unmarshal([]byte(msg.Payload), &info)
 
-	switch info.Tipo {
-	case "broker":
-		b.mu.Lock()
-		b.connBrokers[info.ID] = conn
-		b.ultimoHB[info.ID] = time.Now()
-		b.mu.Unlock()
-		fmt.Printf("[Broker %s] Peer %s conectou (passivo)\n", b.id, info.ID)
-		b.lerMensagens(conn, info.ID)
+		switch info.Tipo {
+		case "broker":
+			b.mu.Lock()
+			b.connBrokers[info.ID] = conn
+			b.ultimoHB[info.ID] = time.Now()
+			b.mu.Unlock()
+			fmt.Printf("[Broker %s] Peer %s conectou (passivo)\n", b.id, info.ID)
+			b.lerMensagens(conn, info.ID)
 
-	case "drone":
-		b.mu.Lock()
-		b.connDrones[conn] = info.ID
-		b.drones[info.ID] = &protocol.Drone{
-			ID:      info.ID,
-			Status:  "disponivel",
-			Bateria: 100,
+		case "drone":
+			b.mu.Lock()
+			b.connDrones[conn] = info.ID
+			if _, existe := b.drones[info.ID]; !existe {
+				b.drones[info.ID] = &protocol.Drone{
+					ID:      info.ID,
+					Status:  "disponivel",
+					Bateria: 100,
+				}
+			}
+			b.mu.Unlock()
+			fmt.Printf("[Broker %s] Drone %s registrado\n", b.id, info.ID)
+			go b.tentarDespachar()
+			b.lerMensagens(conn, info.ID)
+
+		default:
+			b.mu.Lock()
+			b.connClientes[conn] = info.ID
+			b.mu.Unlock()
+			b.lerMensagens(conn, info.ID)
 		}
-		b.mu.Unlock()
-		fmt.Printf("[Broker %s] Drone %s registrado\n", b.id, info.ID)
-		go b.tentarDespachar()
-		b.lerMensagens(conn, info.ID)
-
-	default: // sensor, cliente
+	} else {
+		// FALLBACK: Sensores enviam a ocorrência direto sem handshake
 		b.mu.Lock()
-		b.connClientes[conn] = info.ID
+		b.connClientes[conn] = msg.IDOrigem
 		b.mu.Unlock()
-		b.lerMensagens(conn, info.ID)
+
+		b.despachar(conn, msg)
+		b.lerMensagens(conn, msg.IDOrigem)
 	}
 }
 
@@ -433,7 +442,7 @@ func (b *Broker) handleStatusDrone(conn net.Conn, msg protocol.Mensagem) {
 	}
 
 	b.mu.Lock()
-	droneID := b.connDrones[conn]
+	droneID := msg.IDOrigem // Corrigido para não depender da conexão efémera
 	if d, ok := b.drones[droneID]; ok {
 		d.Status = "disponivel"
 		d.MissaoID = ""
@@ -629,11 +638,9 @@ func (b *Broker) enviarRAOK(peerID string) {
 func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 	b.mu.Lock()
 
-	var droneConn net.Conn
 	var droneID string
-	for c, id := range b.connDrones {
-		if d, ok := b.drones[id]; ok && d.Status == "disponivel" {
-			droneConn = c
+	for id, d := range b.drones {
+		if d.Status == "disponivel" {
 			droneID = id
 			d.Status = "em_missao"
 			d.MissaoID = oc.ID
@@ -641,7 +648,7 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 		}
 	}
 
-	if droneConn == nil {
+	if droneID == "" {
 		oc.Prioridade = 3
 		b.fila.Push(oc)
 		b.mu.Unlock()
@@ -675,7 +682,24 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 		Timestamp: time.Now(),
 		Payload:   string(payload),
 	}
-	json.NewEncoder(droneConn).Encode(msg)
+
+	// Corrigido: O Broker age como cliente conectando à porta do servidor interno do Drone!
+	porta := "909" + string(droneID[len(droneID)-1])
+	addr := droneID + ":" + porta
+	var conn net.Conn
+	var err error
+
+	cfg := &tls.Config{InsecureSkipVerify: true}
+	conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr, cfg)
+	if err != nil {
+		conn, err = net.DialTimeout("tcp", addr, 2*time.Second)
+	}
+	if err == nil {
+		json.NewEncoder(conn).Encode(msg)
+		conn.Close()
+	} else {
+		fmt.Printf("[Broker %s] Falha ao conectar ao drone em %s: %v\n", b.id, addr, err)
+	}
 
 	fmt.Printf("[Broker %s] ✈  Drone %s → ocorrência %s (P%d)\n",
 		b.id, droneID, oc.ID, oc.Prioridade)
@@ -767,7 +791,7 @@ func (b *Broker) handleAceiteBloco(msg protocol.Mensagem) {
 	fmt.Printf("[Broker %s] [Chain] Aceite de %s para bloco #%d (%d/%d)\n",
 		b.id, msg.IDOrigem, bloco.Indice, votos, quorum)
 
-	if votos >= quorum {
+	if votos == quorum {
 		b.commitarBloco(bloco)
 	}
 }
@@ -949,19 +973,10 @@ func (b *Broker) removerConexao(conn net.Conn, id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if droneID, ok := b.connDrones[conn]; ok {
+	if _, ok := b.connDrones[conn]; ok {
 		delete(b.connDrones, conn)
-		if d, ok := b.drones[droneID]; ok {
-			if d.Status == "em_missao" && d.MissaoID != "" {
-				oc := &protocol.Ocorrencia{
-					ID: d.MissaoID, Prioridade: 3, Timestamp: time.Now(),
-				}
-				b.fila.Push(oc)
-				fmt.Printf("[Broker %s] Drone %s morreu em missão. %s volta à fila (P3).\n",
-					b.id, droneID, d.MissaoID)
-			}
-			delete(b.drones, droneID)
-		}
+		// Alteração Vital: NUNCA apagamos o drone do mapa b.drones.
+		// A conexão curta serviu só para ele reportar presença.
 	}
 
 	delete(b.connBrokers, id)

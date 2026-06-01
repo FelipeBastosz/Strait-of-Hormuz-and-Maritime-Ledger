@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"ormuz-p3/protocol"
+	"Strait-of-Hormuz-and-Maritime-Ledger/protocol"
 )
 
 // ============================================================

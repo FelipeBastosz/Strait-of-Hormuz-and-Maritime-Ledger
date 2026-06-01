@@ -20,7 +20,7 @@ import (
 	"os"
 	"time"
 
-	"ormuz-p3/protocol"
+	"Strait-of-Hormuz-and-Maritime-Ledger/protocol"
 )
 
 // Tipos de ocorrências reais do domínio do Estreito de Ormuz

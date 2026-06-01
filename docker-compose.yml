@@ -42,7 +42,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.broker
-    command: ["broker1"]
+    command: ["1"]
     environment:
       CONFIG_PATH: /app/config.json
     volumes:
@@ -58,7 +58,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.broker
-    command: ["broker2"]
+    command: ["2"]
     environment:
       CONFIG_PATH: /app/config.json
     volumes:
@@ -74,7 +74,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.broker
-    command: ["broker3"]
+    command: ["3"]
     environment:
       CONFIG_PATH: /app/config.json
     volumes:
@@ -90,7 +90,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.broker
-    command: ["broker4"]
+    command: ["4"]
     environment:
       CONFIG_PATH: /app/config.json
     volumes:

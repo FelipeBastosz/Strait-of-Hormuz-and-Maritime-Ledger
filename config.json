@@ -1,6 +1,6 @@
 {
-  "broker1": "broker1:9081",
-  "broker2": "broker2:9082",
-  "broker3": "broker3:9083",
-  "broker4": "broker4:9084"
+  "1": "broker1:9081",
+  "2": "broker2:9082",
+  "3": "broker3:9083",
+  "4": "broker4:9084"
 }

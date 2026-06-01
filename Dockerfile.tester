@@ -1,10 +1,19 @@
 # ── Etapa 1: Compilação ──────────────────────────────────────
-FROM golang:1.21-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
+# Define o WORKDIR na raiz do projeto (onde está o go.mod)
 WORKDIR /src
+
+# Copia primeiro apenas o go.mod para aproveitar o cache das dependências
 COPY go.mod ./
+# Se você tiver um go.sum, copie-o também: COPY go.sum ./
+RUN go mod download
+
+# Copia todo o restante do código
 COPY . .
 
+# Compila referenciando o módulo corretamente pelo caminho completo
+# Ajuste "Strait-of-Hormuz-and-Maritime-Ledger" para o NOME exato do seu módulo no go.mod
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/tester ./tester/
 
 # ── Etapa 2: Imagem final ─────────────────────────────────────
@@ -18,5 +27,4 @@ COPY --from=builder /out/tester .
 COPY cert.pem .
 COPY key.pem  .
 
-# Modo interativo — stdin aberto via docker-compose
 ENTRYPOINT ["/app/tester"]

@@ -1,0 +1,33 @@
+# ── Etapa 1: Compilação ──────────────────────────────────────
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /src
+
+# Copia o módulo Go primeiro (cache de dependências)
+COPY go.mod ./
+
+# Copia todo o código-fonte
+COPY . .
+
+# Compila apenas o binário do broker
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/broker ./broker/
+
+# ── Etapa 2: Imagem final (mínima) ───────────────────────────
+FROM alpine:3.19
+
+WORKDIR /app
+
+# Binário compilado
+COPY --from=builder /out/broker .
+
+# Certificados TLS (gerados por gen-certs.sh antes do build)
+COPY cert.pem .
+COPY key.pem  .
+
+# config.json montado via volume no docker-compose
+RUN mkdir -p /app/state
+
+EXPOSE 9081 9082 9083 9084
+
+# ID do broker passado como argumento: ex. CMD ["broker1"]
+ENTRYPOINT ["/app/broker"]

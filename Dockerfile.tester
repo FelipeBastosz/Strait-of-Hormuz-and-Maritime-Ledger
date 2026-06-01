@@ -1,0 +1,22 @@
+# ── Etapa 1: Compilação ──────────────────────────────────────
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /src
+COPY go.mod ./
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/tester ./tester/
+
+# ── Etapa 2: Imagem final ─────────────────────────────────────
+FROM alpine:3.19
+
+WORKDIR /app
+
+COPY --from=builder /out/tester .
+
+# Certificados TLS
+COPY cert.pem .
+COPY key.pem  .
+
+# Modo interativo — stdin aberto via docker-compose
+ENTRYPOINT ["/app/tester"]

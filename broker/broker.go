@@ -176,7 +176,6 @@ func (b *Broker) iniciarServidor() {
 	go b.conectarPeers()
 	go b.heartbeatLoop()
 	go b.monitorarPeers()
-	go b.gossipLoop()
 
 	for {
 		conn, err := listener.Accept()
@@ -351,9 +350,6 @@ func (b *Broker) despachar(conn net.Conn, msg protocol.Mensagem) {
 		b.mu.Lock()
 		b.ultimoHB[msg.IDOrigem] = time.Now()
 		b.mu.Unlock()
-
-	case protocol.TipoSyncEstado:
-		go b.handleGossip(msg)
 
 	case protocol.TipoOcorrencia:
 		go b.handleOcorrencia(conn, msg)
@@ -867,58 +863,6 @@ func (b *Broker) solicitarChain() {
 }
 
 // ============================================================
-// GOSSIP DE ESTADO
-// ============================================================
-
-func (b *Broker) gossipLoop() {
-	ticker := time.NewTicker(intervaloGossip)
-	for range ticker.C {
-		b.enviarGossip()
-	}
-}
-
-func (b *Broker) enviarGossip() {
-	b.mu.Lock()
-	snapshot := state.GlobalState{
-		Drones:       b.drones,
-		FilaEspera:   b.fila.Items(),
-		UltimoUpdate: time.Now().UnixNano(),
-	}
-	peers := make([]net.Conn, 0, len(b.connBrokers))
-	for _, c := range b.connBrokers {
-		peers = append(peers, c)
-	}
-	b.mu.Unlock()
-
-	payload, _ := json.Marshal(snapshot)
-	msg := protocol.Mensagem{
-		Tipo:      protocol.TipoSyncEstado,
-		IDOrigem:  b.id,
-		Timestamp: time.Now(),
-		Payload:   string(payload),
-	}
-	for _, c := range peers {
-		json.NewEncoder(c).Encode(msg)
-	}
-}
-
-func (b *Broker) handleGossip(msg protocol.Mensagem) {
-	var snap state.GlobalState
-	if err := json.Unmarshal([]byte(msg.Payload), &snap); err != nil {
-		return
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for id, d := range snap.Drones {
-		if _, existe := b.drones[id]; !existe {
-			b.drones[id] = d
-		}
-	}
-}
-
-// ============================================================
 // HEARTBEAT E MONITORAMENTO DE PEERS
 // ============================================================
 
@@ -972,6 +916,8 @@ func (b *Broker) monitorarPeers() {
 func (b *Broker) removerConexao(conn net.Conn, id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	fmt.Printf("[Broker %s] Conexão removida: ID %s - %s\n", b.id, id, conn.RemoteAddr())
 
 	if _, ok := b.connDrones[conn]; ok {
 		delete(b.connDrones, conn)

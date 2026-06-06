@@ -156,11 +156,19 @@ func (d *Drone) processarComando(conn net.Conn) {
 		switch msg.Tipo {
 		case protocol.TipoComandoDrone:
 			d.mu.Lock()
+
 			if d.Status != "disponivel" {
 				fmt.Printf("[Drone %s] Recusei missão — status: %s\n", d.ID, d.Status)
 				d.mu.Unlock()
+				
+				// NOVO: Tem que mandar o JSON avisando o broker da rejeição!
+				rejeicao := map[string]interface{}{
+					"acao": "rejeitado",
+				}
+				json.NewEncoder(conn).Encode(rejeicao)
 				return
 			}
+
 			d.Status = "em_missao"
 			d.mu.Unlock()
 
@@ -229,19 +237,21 @@ func (d *Drone) executarMissao(comando protocol.ComandoMissao) {
 		Descricao: comando.Descricao,
 		Timestamp: time.Now(),
 	}
-	
-	// Envia o laudo estruturado para todos os brokers
-	d.reportarLaudo(laudo)
-
-	d.reportarLaudo(laudo)
 
 	if batAtual < 20 {
-		d.recarregar()
+		fmt.Printf("[Drone %s] ⚡ Bateria baixa. Iniciando recarga...\n", d.ID)
+		d.mu.Lock()
+		d.Status = "recarregando"
+		d.mu.Unlock()
+		go d.recarregar() // Usa goroutine para não atrasar o envio do laudo
 	} else {
 		d.mu.Lock()
-		d.Status = "disponivel"
+		d.Status = "disponivel" // <-- CRÍTICO: Define como livre ANTES do broadcast
 		d.mu.Unlock()
 	}
+
+	// Avisa os Brokers (eles já encontrarão o drone livre se vierem rápido)
+	d.reportarLaudo(laudo)
 }
 
 func (d *Drone) recarregar() {

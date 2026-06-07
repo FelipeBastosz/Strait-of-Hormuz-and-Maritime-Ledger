@@ -7,8 +7,9 @@
 // RTT, e injetar múltiplas requisições simultâneas.
 //
 // Adicionado no Problema 3:
-//   - Comando "chain" para exibir tamanho do ledger
-//   - Comando "saldo" para consultar créditos de uma companhia
+//   - Comando "chain <addr>"             → exibe todos os blocos da chain
+//   - Comando "saldo <addr> <companhia>" → consulta créditos de uma companhia
+//   - Comando "watch <on|off>"           → log em tempo real do consenso de blocos
 //
 // Uso: tester [broker1:9081] [broker2:9082] ...
 // ============================================================
@@ -27,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"Strait-of-Hormuz-and-Maritime-Ledger/blockchain"
 	"Strait-of-Hormuz-and-Maritime-Ledger/protocol"
 )
 
@@ -34,10 +36,36 @@ import (
 // STRUCTS
 // ============================================================
 
+// connSegura encapsula uma conexão com um encoder exclusivo e mutex próprio.
+// Isso garante que apenas um goroutine escreve por vez nessa conn,
+// evitando intercalamento de JSON quando heartbeat, req e OK disputam o socket.
+type connSegura struct {
+	mu      sync.Mutex
+	conn    net.Conn
+	encoder *json.Encoder
+}
+
+func novaConnSegura(conn net.Conn) *connSegura {
+	return &connSegura{
+		conn:    conn,
+		encoder: json.NewEncoder(conn),
+	}
+}
+
+func (c *connSegura) enviar(msg protocol.Mensagem) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.encoder.Encode(msg)
+}
+
+func (c *connSegura) fechar() {
+	c.conn.Close()
+}
+
 type Tester struct {
 	mu      sync.Mutex
 	id      string
-	conns   map[string]net.Conn
+	conns   map[string]*connSegura // addr → connSegura
 	relogio int64
 	// Canal onde chegam todas as mensagens dos brokers
 	incoming chan mensagemRecebida
@@ -45,6 +73,11 @@ type Tester struct {
 	pong     chan mensagemRecebida
 	// OKs pendentes de envio manual
 	pendentes map[string]string // brokerID → addr
+
+	// ---- Blockchain monitoring ----------------------------------
+	watchBloco bool
+	respChain  chan mensagemRecebida
+	respSaldo  chan mensagemRecebida
 }
 
 type mensagemRecebida struct {
@@ -59,11 +92,13 @@ type mensagemRecebida struct {
 func novoTester(addrs []string) *Tester {
 	t := &Tester{
 		id:        fmt.Sprintf("tester-%d", time.Now().UnixNano()%10000),
-		conns:     make(map[string]net.Conn),
+		conns:     make(map[string]*connSegura),
 		incoming:  make(chan mensagemRecebida, 256),
 		autoOK:    true,
 		pong:      make(chan mensagemRecebida, 1),
 		pendentes: make(map[string]string),
+		respChain: make(chan mensagemRecebida, 4),
+		respSaldo: make(chan mensagemRecebida, 4),
 	}
 	for _, addr := range addrs {
 		t.conectar(addr)
@@ -72,14 +107,13 @@ func novoTester(addrs []string) *Tester {
 }
 
 // ============================================================
-// CONEXÃO TLS (Daniel)
+// CONEXÃO TLS
 // ============================================================
 
 func (t *Tester) conectar(addr string) {
 	cfg := &tls.Config{InsecureSkipVerify: true}
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, cfg)
 	if err != nil {
-		// Fallback TCP puro
 		conn2, err2 := net.DialTimeout("tcp", addr, 3*time.Second)
 		if err2 != nil {
 			fmt.Printf("[TESTER] Não foi possível conectar a %s: %v\n", addr, err2)
@@ -91,53 +125,54 @@ func (t *Tester) conectar(addr string) {
 	t.registrarConn(addr, conn)
 }
 
-func (t *Tester) registrarConn(addr string, conn net.Conn) {
-	// Handshake: apresenta-se como broker para receber broadcasts do RA
+func (t *Tester) registrarConn(addr string, rawConn net.Conn) {
+	cs := novaConnSegura(rawConn)
+
+	// Handshake: apresenta-se como broker para entrar no connBrokers do cluster
+	// e receber todos os broadcasts (RARequest, NovoBloco, AceiteBloco etc.)
 	info := protocol.InfoConexao{Tipo: "broker", ID: t.id}
 	payload, _ := json.Marshal(info)
-	msg := protocol.Mensagem{
+	cs.enviar(protocol.Mensagem{
 		Tipo:      protocol.TipoHandshake,
 		IDOrigem:  t.id,
 		Timestamp: time.Now(),
 		Payload:   string(payload),
-	}
-	json.NewEncoder(conn).Encode(msg)
+	})
 
 	t.mu.Lock()
-	t.conns[addr] = conn
+	t.conns[addr] = cs
 	t.mu.Unlock()
 
 	fmt.Printf("[TESTER] Conectado a %s\n", addr)
 
-	go t.receberMensagens(addr, conn)
-	go t.heartbeat(addr, conn)
+	go t.receberMensagens(addr, cs)
+	go t.heartbeat(addr, cs)
 }
 
-func (t *Tester) heartbeat(addr string, conn net.Conn) {
+// heartbeat mantém a conexão viva e atualiza ultimoHB do broker.
+// Usa o connSegura para não disputar o socket com outros goroutines.
+func (t *Tester) heartbeat(addr string, cs *connSegura) {
 	ticker := time.NewTicker(4 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		msg := protocol.Mensagem{
+		err := cs.enviar(protocol.Mensagem{
 			Tipo:      protocol.TipoHeartbeat,
 			IDOrigem:  t.id,
 			Timestamp: time.Now(),
-		}
-		if _, err := fmt.Fprintf(conn, ""); err != nil {
-			// Testa se a conexão ainda está viva antes de enviar
-		}
-		if err := json.NewEncoder(conn).Encode(msg); err != nil {
+		})
+		if err != nil {
 			fmt.Printf("[TESTER] Conexão com %s perdida\n", addr)
 			t.mu.Lock()
 			delete(t.conns, addr)
 			t.mu.Unlock()
-			conn.Close()
+			cs.fechar()
 			return
 		}
 	}
 }
 
-func (t *Tester) receberMensagens(addr string, conn net.Conn) {
-	scanner := bufio.NewScanner(conn)
+func (t *Tester) receberMensagens(addr string, cs *connSegura) {
+	scanner := bufio.NewScanner(cs.conn)
 	for scanner.Scan() {
 		var msg protocol.Mensagem
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
@@ -174,23 +209,97 @@ func (t *Tester) processar() {
 			t.mu.Unlock()
 
 			if auto {
-				t.enviarRAOK(addr, req.BrokerID)
+				go t.enviarRAOK(addr, req.BrokerID)
 			}
 
 		case protocol.TipoRAOK:
 			fmt.Printf("[RA] OK  de broker=%-10s  (via %s)\n", msg.IDOrigem, addr)
 
 		case protocol.TipoPong:
-			t.pong <- recv
+			select {
+			case t.pong <- recv:
+			default:
+			}
 
 		case protocol.TipoHeartbeat:
-			// Ignora heartbeats recebidos dos brokers
+			// Broker mandou heartbeat → responde com pong pelo mesmo connSegura
+			t.mu.Lock()
+			cs, ok := t.conns[addr]
+			t.mu.Unlock()
+			if ok {
+				go cs.enviar(protocol.Mensagem{
+					Tipo:      protocol.TipoPong,
+					IDOrigem:  t.id,
+					Timestamp: time.Now(),
+				})
+			}
 
 		case protocol.TipoSyncEstado:
-			// Apenas registra que recebeu — não processa o estado
 			fmt.Printf("[TESTER] SYNC recebido de %s\n", msg.IDOrigem)
+
+		// ---- Blockchain: consenso ao vivo ----------------------
+
+		case protocol.TipoNovoBloco:
+			t.mu.Lock()
+			watch := t.watchBloco
+			t.mu.Unlock()
+			if watch {
+				var bloco blockchain.Bloco
+				if err := json.Unmarshal([]byte(msg.Payload), &bloco); err == nil {
+					hashCurto := bloco.Hash
+					if len(hashCurto) > 12 {
+						hashCurto = hashCurto[:12] + "…"
+					}
+					fmt.Printf("\n[CHAIN] NOVO_BLOCO  #%-4d  tipo=%-12s  hash=%s  validador=%s\n",
+						bloco.Indice, bloco.TipoDados, hashCurto, bloco.Validador)
+				}
+			}
+
+		case protocol.TipoAceiteBloco:
+			t.mu.Lock()
+			watch := t.watchBloco
+			t.mu.Unlock()
+			if watch {
+				var voto struct {
+					Hash string `json:"hash"`
+				}
+				if err := json.Unmarshal([]byte(msg.Payload), &voto); err == nil {
+					hashCurto := voto.Hash
+					if len(hashCurto) > 12 {
+						hashCurto = hashCurto[:12] + "…"
+					}
+					fmt.Printf("[CHAIN] ACEITE      hash=%s  votante=%s\n",
+						hashCurto, msg.IDOrigem)
+				}
+			}
+
+		// ---- Blockchain: respostas a comandos do tester --------
+
+		case protocol.TipoRespChain:
+			select {
+			case t.respChain <- recv:
+			default:
+			}
+
+		case protocol.TipoRespSaldo:
+			select {
+			case t.respSaldo <- recv:
+			default:
+			}
 		}
 	}
+}
+
+// ============================================================
+// HELPERS DE ENVIO
+// ============================================================
+
+// connPara retorna o connSegura para um addr, já com lock.
+func (t *Tester) connPara(addr string) (*connSegura, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	cs, ok := t.conns[addr]
+	return cs, ok
 }
 
 // ============================================================
@@ -198,25 +307,27 @@ func (t *Tester) processar() {
 // ============================================================
 
 func (t *Tester) ping(addr string) {
-	t.mu.Lock()
-	conn, ok := t.conns[addr]
-	t.mu.Unlock()
+	cs, ok := t.connPara(addr)
 	if !ok {
 		fmt.Printf("[TESTER] sem conexão com %s\n", addr)
 		return
+	}
+
+	// Drena pongs antigos antes de começar
+	for len(t.pong) > 0 {
+		<-t.pong
 	}
 
 	const count = 3
 	var rtts []float64
 
 	for i := 0; i < count; i++ {
-		msg := protocol.Mensagem{
+		t0 := time.Now()
+		cs.enviar(protocol.Mensagem{
 			Tipo:      protocol.TipoHeartbeat,
 			IDOrigem:  t.id,
 			Timestamp: time.Now(),
-		}
-		t0 := time.Now()
-		json.NewEncoder(conn).Encode(msg)
+		})
 
 		select {
 		case <-t.pong:
@@ -248,9 +359,7 @@ func (t *Tester) ping(addr string) {
 
 // enviarRequisicao injeta uma ocorrência no broker com a prioridade dada.
 func (t *Tester) enviarRequisicao(addr string, prioridade int, n int, companhia string) {
-	t.mu.Lock()
-	conn, ok := t.conns[addr]
-	t.mu.Unlock()
+	cs, ok := t.connPara(addr)
 	if !ok {
 		fmt.Printf("[TESTER] sem conexão com %s\n", addr)
 		return
@@ -272,13 +381,12 @@ func (t *Tester) enviarRequisicao(addr string, prioridade int, n int, companhia 
 			Creditos:    10,
 		}
 		payload, _ := json.Marshal(oc)
-		msg := protocol.Mensagem{
+		if err := cs.enviar(protocol.Mensagem{
 			Tipo:      protocol.TipoOcorrencia,
 			IDOrigem:  t.id,
 			Timestamp: time.Now(),
 			Payload:   string(payload),
-		}
-		if err := json.NewEncoder(conn).Encode(msg); err != nil {
+		}); err != nil {
 			fmt.Printf("[TESTER] erro ao enviar req %d: %v\n", i+1, err)
 			return
 		}
@@ -289,19 +397,144 @@ func (t *Tester) enviarRequisicao(addr string, prioridade int, n int, companhia 
 }
 
 func (t *Tester) enviarRAOK(addr, brokerID string) {
-	t.mu.Lock()
-	conn, ok := t.conns[addr]
-	t.mu.Unlock()
+	cs, ok := t.connPara(addr)
 	if !ok {
 		return
 	}
-	msg := protocol.Mensagem{
+	cs.enviar(protocol.Mensagem{
 		Tipo:      protocol.TipoRAOK,
 		IDOrigem:  t.id,
 		Timestamp: time.Now(),
-	}
-	json.NewEncoder(conn).Encode(msg)
+	})
 	fmt.Printf("[RA] OK enviado para broker=%s\n", brokerID)
+}
+
+// ============================================================
+// BLOCKCHAIN — COMANDOS
+// ============================================================
+
+// consultarChain solicita a chain completa a um broker e exibe os blocos.
+func (t *Tester) consultarChain(addr string) {
+	cs, ok := t.connPara(addr)
+	if !ok {
+		fmt.Printf("[TESTER] sem conexão com %s\n", addr)
+		return
+	}
+
+	// Drena respostas antigas antes de enviar nova solicitação
+	for len(t.respChain) > 0 {
+		<-t.respChain
+	}
+
+	if err := cs.enviar(protocol.Mensagem{
+		Tipo:      protocol.TipoReqChain,
+		IDOrigem:  t.id,
+		Timestamp: time.Now(),
+	}); err != nil {
+		fmt.Printf("[TESTER] erro ao solicitar chain: %v\n", err)
+		return
+	}
+
+	select {
+	case recv := <-t.respChain:
+		t.exibirChain(recv.msg)
+	case <-time.After(5 * time.Second):
+		fmt.Println("[CHAIN] timeout aguardando resposta do broker")
+	}
+}
+
+// exibirChain imprime um resumo legível de cada bloco da chain.
+func (t *Tester) exibirChain(msg protocol.Mensagem) {
+	var blocos []blockchain.Bloco
+	if err := json.Unmarshal([]byte(msg.Payload), &blocos); err != nil {
+		fmt.Printf("[CHAIN] Erro ao decodificar chain: %v\n", err)
+		return
+	}
+
+	fmt.Printf("\n╔══════════════════════════════════════════════════════════════════╗\n")
+	fmt.Printf("║  BLOCKCHAIN — %d bloco(s)  (broker=%s)\n", len(blocos), msg.IDOrigem)
+	fmt.Printf("╠══════════════════════════════════════════════════════════════════╣\n")
+
+	for _, b := range blocos {
+		hashCurto := b.Hash
+		if len(hashCurto) > 16 {
+			hashCurto = hashCurto[:16] + "…"
+		}
+		hashAnterior := b.HashAnterior
+		if len(hashAnterior) > 16 {
+			hashAnterior = hashAnterior[:16] + "…"
+		}
+
+		fmt.Printf("║  #%-4d  tipo=%-14s  validador=%-10s\n",
+			b.Indice, b.TipoDados, b.Validador)
+		fmt.Printf("║         hash=%s  anterior=%s\n", hashCurto, hashAnterior)
+		fmt.Printf("║         ts=%s\n", b.Timestamp.Format("2006-01-02 15:04:05.000"))
+
+		switch b.TipoDados {
+		case blockchain.TipoBloco_Transacao:
+			var tx protocol.Transacao
+			if err := json.Unmarshal([]byte(b.Dados), &tx); err == nil {
+				fmt.Printf("║         tx: %s → %s  créditos=%d  oc=%s\n",
+					tx.De, tx.Para, tx.Creditos, tx.OcorrenciaID)
+			}
+		case blockchain.TipoBloco_Laudo:
+			var laudo protocol.Laudo
+			if err := json.Unmarshal([]byte(b.Dados), &laudo); err == nil {
+				fmt.Printf("║         laudo: missão=%s  drone=%s  resultado=%s\n",
+					laudo.MissaoID, laudo.DroneID, laudo.Resultado)
+			}
+		case blockchain.TipoBloco_Genesis:
+			fmt.Printf("║         (bloco gênese)\n")
+		default:
+			dados := b.Dados
+			if len(dados) > 60 {
+				dados = dados[:60] + "…"
+			}
+			fmt.Printf("║         dados: %s\n", dados)
+		}
+		fmt.Printf("╠══════════════════════════════════════════════════════════════════╣\n")
+	}
+	fmt.Printf("╚══════════════════════════════════════════════════════════════════╝\n")
+}
+
+// consultarSaldo solicita o saldo de uma companhia a um broker específico.
+// O broker usa msg.IDOrigem como identificador da companhia (ver handleConsultaSaldo).
+func (t *Tester) consultarSaldo(addr, companhia string) {
+	cs, ok := t.connPara(addr)
+	if !ok {
+		fmt.Printf("[TESTER] sem conexão com %s\n", addr)
+		return
+	}
+
+	// Drena respostas antigas antes de enviar nova solicitação
+	for len(t.respSaldo) > 0 {
+		<-t.respSaldo
+	}
+
+	if err := cs.enviar(protocol.Mensagem{
+		Tipo:      protocol.TipoConsultaSaldo,
+		IDOrigem:  companhia, // broker usa IDOrigem como ID da companhia a consultar
+		Timestamp: time.Now(),
+	}); err != nil {
+		fmt.Printf("[TESTER] erro ao solicitar saldo: %v\n", err)
+		return
+	}
+
+	select {
+	case recv := <-t.respSaldo:
+		var payload struct {
+			Companhia string `json:"companhia"`
+			Saldo     int    `json:"saldo"`
+		}
+		if err := json.Unmarshal([]byte(recv.msg.Payload), &payload); err != nil {
+			fmt.Printf("[SALDO] Erro ao decodificar resposta: %v\n", err)
+			return
+		}
+		fmt.Printf("[SALDO] %-15s  créditos=%d  (broker=%s)\n",
+			payload.Companhia, payload.Saldo, recv.msg.IDOrigem)
+	case <-time.After(5 * time.Second):
+		fmt.Println("[SALDO] timeout aguardando resposta do broker")
+	}
 }
 
 // ============================================================
@@ -318,6 +551,9 @@ func (t *Tester) cli() {
 	fmt.Println("║  req    <addr> <prio> <n> [companhia]            ║")
 	fmt.Println("║  autoOK <on|off>                                 ║")
 	fmt.Println("║  ok     <brokerID>                               ║")
+	fmt.Println("║  chain  <addr>                                   ║")
+	fmt.Println("║  saldo  <addr> <companhia>                       ║")
+	fmt.Println("║  watch  <on|off>                                 ║")
 	fmt.Println("║  quit                                            ║")
 	fmt.Println("╚══════════════════════════════════════════════════╝")
 	fmt.Print("> ")
@@ -389,6 +625,38 @@ func (t *Tester) cli() {
 				break
 			}
 			go t.enviarRAOK(addr, brokerID)
+
+		case "chain":
+			if len(partes) < 2 {
+				fmt.Println("uso: chain <addr>")
+				break
+			}
+			go t.consultarChain(partes[1])
+
+		case "saldo":
+			if len(partes) < 3 {
+				fmt.Println("uso: saldo <addr> <companhia>")
+				break
+			}
+			go t.consultarSaldo(partes[1], partes[2])
+
+		case "watch":
+			if len(partes) < 2 {
+				fmt.Println("uso: watch <on|off>")
+				break
+			}
+			t.mu.Lock()
+			switch partes[1] {
+			case "on":
+				t.watchBloco = true
+				fmt.Println("[CHAIN] monitoramento de consenso ativado")
+			case "off":
+				t.watchBloco = false
+				fmt.Println("[CHAIN] monitoramento de consenso desativado")
+			default:
+				fmt.Println("uso: watch <on|off>")
+			}
+			t.mu.Unlock()
 
 		case "quit":
 			fmt.Println("encerrando.")

@@ -22,6 +22,7 @@ const (
 	TipoStatusDrone   = "STATUS_DRONE"   // Drone concluiu missão
 	TipoComandoDrone  = "COMANDO_DRONE"  // Broker ordenando drone a se mover
 	TipoRegistroDrone = "REGISTRO_DRONE" // Drone se apresentando ao cluster
+	TipoReservaDrone  = "RESERVA_DRONE"  // Drone reservado para um Broker específico
 	TipoACK           = "ACK"            // Confirmação de recebimento
 
 	// --- Sincronização de estado (Felipe) ---

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"math/rand"
 
 	"Strait-of-Hormuz-and-Maritime-Ledger/blockchain"
 	"Strait-of-Hormuz-and-Maritime-Ledger/protocol"
@@ -176,7 +177,6 @@ func (b *Broker) iniciarServidor() {
 	go b.conectarPeers()
 	go b.heartbeatLoop()
 	go b.monitorarPeers()
-	go b.gossipLoop()
 
 	for {
 		conn, err := listener.Accept()
@@ -351,15 +351,20 @@ func (b *Broker) despachar(conn net.Conn, msg protocol.Mensagem) {
 		b.mu.Lock()
 		b.ultimoHB[msg.IDOrigem] = time.Now()
 		b.mu.Unlock()
-
-	case protocol.TipoSyncEstado:
-		go b.handleGossip(msg)
+		
+	case protocol.TipoReservaDrone:
+		b.mu.Lock()
+		if d, ok := b.drones[msg.Payload]; ok {
+			d.Status = "em_missao"
+		}
+		b.mu.Unlock()
 
 	case protocol.TipoOcorrencia:
 		go b.handleOcorrencia(conn, msg)
 
 	case protocol.TipoStatusDrone:
 		go b.handleStatusDrone(conn, msg)
+
 
 	case protocol.TipoRARequest:
 		go b.handleRARequest(conn, msg)
@@ -442,15 +447,28 @@ func (b *Broker) handleStatusDrone(conn net.Conn, msg protocol.Mensagem) {
 	}
 
 	b.mu.Lock()
-	droneID := msg.IDOrigem // Corrigido para não depender da conexão efémera
+	droneID := msg.IDOrigem 
 	if d, ok := b.drones[droneID]; ok {
 		d.Status = "disponivel"
 		d.MissaoID = ""
 	}
+
+	// Despachando OKs adiados
+	adiados := make([]string, 0, len(b.deferred))
+	for id := range b.deferred {
+		adiados = append(adiados, id)
+	}
+	b.deferred = make(map[string]bool) // Limpa a lista completamente
 	b.mu.Unlock()
 
 	fmt.Printf("[Broker %s] ✅ Missão %s concluída | drone=%s | resultado: %s\n",
 		b.id, laudo.MissaoID, laudo.DroneID, laudo.Resultado)
+
+	// Dispara o OK para todos que estavam esperando, eles que se desempatem!
+	for _, peerID := range adiados {
+		fmt.Printf("[Broker %s] [RA] Recurso liberado! Enviando OK adiado para %s\n", b.id, peerID)
+		b.enviarRAOK(peerID)
+	}
 
 	go b.proporBloco(blockchain.TipoBloco_Laudo, laudo)
 	go b.tentarDespachar()
@@ -542,9 +560,7 @@ func (b *Broker) handleRARequest(conn net.Conn, msg protocol.Mensagem) {
 
 	b.mu.Lock()
 	b.relogioLocal = maxInt64(b.relogioLocal, req.Relogio) + 1
-
 	meuRelogio := b.currentReqRA.Relogio
-
 	idLocal, err1 := strconv.Atoi(b.id)
 	idReq, err2 := strconv.Atoi(req.BrokerID)
 
@@ -555,12 +571,26 @@ func (b *Broker) handleRARequest(conn net.Conn, msg protocol.Mensagem) {
 		deveAdiar = b.inCS || (b.requesting && (meuRelogio < req.Relogio || (meuRelogio == req.Relogio && b.id < req.BrokerID)))
 	}
 
+	// === Descarte de adiamento se houver drones extras ===
+	if deveAdiar {
+		livres := b.dronesLivres()
+		vagasReservadas := 0
+		if b.requesting {
+			vagasReservadas = 1 // Garanto pelo menos 1 para a minha própria requisição
+		}
+		
+		if livres > vagasReservadas {
+			deveAdiar = false
+			fmt.Printf("[Broker %s] [RA] Vaga extra disponível! Liberando OK imediato para %s\n", b.id, req.BrokerID)
+		}
+	}
+
 	if deveAdiar {
 		b.deferred[req.BrokerID] = true
 		b.mu.Unlock()
-		fmt.Printf("[Broker %s] [RA] Adiando OK para %s (meu relógio=%d, dele=%d)\n",
-			b.id, req.BrokerID, meuRelogio, req.Relogio)
+		fmt.Printf("[Broker %s] [RA] Adiando OK para %s (sem drones extras)\n", b.id, req.BrokerID)
 	} else {
+		delete(b.deferred, req.BrokerID) // Garante que foi descartado
 		b.mu.Unlock()
 		b.enviarRAOK(req.BrokerID)
 	}
@@ -599,22 +629,30 @@ func (b *Broker) entrarCS(oc *protocol.Ocorrencia) {
 	b.mu.Unlock()
 
 	fmt.Printf("[Broker %s] [RA] → CS | ocorrência=%s\n", b.id, oc.ID)
-
 	b.despacharDrone(oc)
 
 	b.mu.Lock()
 	b.inCS = false
-	adiados := make([]string, 0, len(b.deferred))
-	for id := range b.deferred {
-		adiados = append(adiados, id)
+	
+	livres := b.dronesLivres()
+	var peersParaLiberar []string
+	
+	// Só libera os OKs adiados se, após despachar o meu drone, ainda houver vaga na garagem.
+	if livres > 0 {
+		for id := range b.deferred {
+			peersParaLiberar = append(peersParaLiberar, id)
+		}
+		b.deferred = make(map[string]bool) // Limpa tudo
 	}
-	b.deferred = make(map[string]bool)
 	b.mu.Unlock()
 
-	fmt.Printf("[Broker %s] [RA] ← CS | enviando OKs adiados: %v\n", b.id, adiados)
-	for _, peerID := range adiados {
+	// Se liberou, manda para todos e deixa o RA desempatar
+	for _, peerID := range peersParaLiberar {
+		fmt.Printf("[Broker %s] [RA] ← CS | Vagas sobrando. Enviando OK adiado para %s\n", b.id, peerID)
 		b.enviarRAOK(peerID)
 	}
+
+	go b.tentarDespachar()
 }
 
 func (b *Broker) enviarRAOK(peerID string) {
@@ -639,13 +677,31 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 	b.mu.Lock()
 
 	var droneID string
+	var disponiveis []string
+
+	// Levanta todos os drones livres
 	for id, d := range b.drones {
 		if d.Status == "disponivel" {
-			droneID = id
-			d.Status = "em_missao"
-			d.MissaoID = oc.ID
-			break
+			disponiveis = append(disponiveis, id)
 		}
+	}
+
+	// Escolhe um drone aleatoriamente para evitar que Brokers paralelos peguem o mesmo
+	if len(disponiveis) > 0 {
+		droneID = disponiveis[rand.Intn(len(disponiveis))] 
+		d := b.drones[droneID]
+		d.Status = "em_missao"
+		d.MissaoID = oc.ID
+	}
+
+	reservaMsg := protocol.Mensagem{
+		Tipo:      protocol.TipoReservaDrone,
+		IDOrigem:  b.id,
+		Timestamp: time.Now(),
+		Payload:   droneID, 
+	}
+	for _, c := range b.connBrokers {
+		json.NewEncoder(c).Encode(reservaMsg)
 	}
 
 	if droneID == "" {
@@ -695,10 +751,54 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 		conn, err = net.DialTimeout("tcp", addr, 2*time.Second)
 	}
 	if err == nil {
+		defer conn.Close()
 		json.NewEncoder(conn).Encode(msg)
-		conn.Close()
+
+		// Aguarda até 3 segundos pela resposta do drone
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var resposta map[string]interface{}
+		errDecode := json.NewDecoder(conn).Decode(&resposta)
+		
+		rejeitado := false
+		if errDecode == nil {
+			if acao, ok := resposta["acao"].(string); ok && acao == "rejeitado" {
+				rejeitado = true
+			}
+		}
+
+		// Se o drone mandou "rejeitado" ou a conexão caiu/deu erro de leitura
+		if rejeitado || errDecode != nil {
+			motivo := "rejeição do drone"
+			if errDecode != nil {
+				motivo = "falha na resposta (timeout/EOF)"
+			}
+			
+			fmt.Printf("[Broker %s] Falha ao despachar para drone %s (%s). Devolvendo à fila.\n", b.id, droneID, motivo)
+			
+			// Reverte o status local urgentemente
+			b.mu.Lock()
+			if d, ok := b.drones[droneID]; ok {
+				d.Status = "disponivel"
+				d.MissaoID = ""
+			}
+			oc.Prioridade = 3 
+			b.fila.Push(oc)
+			b.mu.Unlock()
+
+			// Roda a roleta de novo
+			go b.tentarDespachar()
+			return // Sai para não printar a mensagem de sucesso
+		}
+
+		fmt.Printf("[Broker %s] ✈  Drone %s → ocorrência %s (P%d)\n", b.id, droneID, oc.ID, oc.Prioridade)
 	} else {
-		fmt.Printf("[Broker %s] Falha ao conectar ao drone em %s: %v\n", b.id, addr, err)
+        // Se falhar a conexão, a ocorrência também deve voltar para a fila!
+		fmt.Printf("[Broker %s] Falha de rede com drone %s: %v. Devolvendo à fila.\n", b.id, droneID, err)
+		b.mu.Lock()
+		b.fila.Push(oc)
+		b.mu.Unlock()
+
+		go b.tentarDespachar()
 	}
 
 	fmt.Printf("[Broker %s] ✈  Drone %s → ocorrência %s (P%d)\n",
@@ -867,58 +967,6 @@ func (b *Broker) solicitarChain() {
 }
 
 // ============================================================
-// GOSSIP DE ESTADO
-// ============================================================
-
-func (b *Broker) gossipLoop() {
-	ticker := time.NewTicker(intervaloGossip)
-	for range ticker.C {
-		b.enviarGossip()
-	}
-}
-
-func (b *Broker) enviarGossip() {
-	b.mu.Lock()
-	snapshot := state.GlobalState{
-		Drones:       b.drones,
-		FilaEspera:   b.fila.Items(),
-		UltimoUpdate: time.Now().UnixNano(),
-	}
-	peers := make([]net.Conn, 0, len(b.connBrokers))
-	for _, c := range b.connBrokers {
-		peers = append(peers, c)
-	}
-	b.mu.Unlock()
-
-	payload, _ := json.Marshal(snapshot)
-	msg := protocol.Mensagem{
-		Tipo:      protocol.TipoSyncEstado,
-		IDOrigem:  b.id,
-		Timestamp: time.Now(),
-		Payload:   string(payload),
-	}
-	for _, c := range peers {
-		json.NewEncoder(c).Encode(msg)
-	}
-}
-
-func (b *Broker) handleGossip(msg protocol.Mensagem) {
-	var snap state.GlobalState
-	if err := json.Unmarshal([]byte(msg.Payload), &snap); err != nil {
-		return
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for id, d := range snap.Drones {
-		if _, existe := b.drones[id]; !existe {
-			b.drones[id] = d
-		}
-	}
-}
-
-// ============================================================
 // HEARTBEAT E MONITORAMENTO DE PEERS
 // ============================================================
 
@@ -972,6 +1020,8 @@ func (b *Broker) monitorarPeers() {
 func (b *Broker) removerConexao(conn net.Conn, id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	fmt.Printf("[Broker %s] Conexão removida: ID %s - %s\n", b.id, id, conn.RemoteAddr())
 
 	if _, ok := b.connDrones[conn]; ok {
 		delete(b.connDrones, conn)

@@ -64,25 +64,27 @@ type Chain struct {
 
 // NovaChain cria uma chain com bloco gênesis e saldos iniciais das companhias.
 // saldosIniciais permite configurar cada companhia com créditos ao iniciar.
+// NovaChain cria uma chain com bloco gênesis estático e saldos iniciais.
 func NovaChain(brokerID string, saldosIniciais map[string]int) *Chain {
 	c := &Chain{
 		Saldos:  make(map[string]int),
 		DroneID: brokerID,
 	}
 
-	// Copia os saldos iniciais
 	for k, v := range saldosIniciais {
 		c.Saldos[k] = v
 	}
 
-	// Gênesis: bloco zero, sem antecessor
+	// GÊNESIS DETERMINÍSTICO: Todos os brokers geram exatamente o mesmo bloco
+	timestampGenesis, _ := time.Parse(time.RFC3339, "2026-01-01T00:00:00Z")
+
 	genesis := Bloco{
 		Indice:       0,
-		Timestamp:    time.Now(),
+		Timestamp:    timestampGenesis,
 		TipoDados:    TipoBloco_Genesis,
-		Dados:        fmt.Sprintf(`{"mensagem":"Genesis block - Estreito de Ormuz P3","broker":"%s"}`, brokerID),
+		Dados:        `{"mensagem":"Genesis block - Estreito de Ormuz P3","broker":"SISTEMA"}`,
 		HashAnterior: "0000000000000000",
-		Validador:    brokerID,
+		Validador:    "SISTEMA",
 	}
 	genesis.Hash = calcularHash(genesis)
 	c.Blocos = append(c.Blocos, genesis)

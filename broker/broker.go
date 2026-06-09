@@ -54,8 +54,10 @@ type Broker struct {
 
 	drones map[string]*protocol.Drone
 	fila   state.FilaComAging
+	missoesAtivas map[string]bool
 
 	encerrando bool
+
 
 	// ---- Ricart-Agrawala ----------------------------------------
 	relogioLocal int64
@@ -95,6 +97,7 @@ func novoBroker(id string, mapaRede map[string]string) *Broker {
 		endereco:        mapaRede[id],
 		mapaRede:        mapaRede,
 		drones:          make(map[string]*protocol.Drone),
+		missoesAtivas:   make(map[string]bool), 
 		respostasOK:     make(map[string]bool),
 		deferred:        make(map[string]bool),
 		connBrokers:     make(map[string]net.Conn),
@@ -470,7 +473,18 @@ func (b *Broker) handleStatusDrone(conn net.Conn, msg protocol.Mensagem) {
 		b.enviarRAOK(peerID)
 	}
 
-	go b.proporBloco(blockchain.TipoBloco_Laudo, laudo)
+	b.mu.Lock()
+	eraMinhaMissao := b.missoesAtivas[laudo.MissaoID]
+	if eraMinhaMissao {
+		delete(b.missoesAtivas, laudo.MissaoID) // Limpa da memória
+	}
+	b.mu.Unlock()
+
+	// Apenas o Broker que despachou o drone tem o direito de propor o bloco
+	if eraMinhaMissao {
+		go b.proporBloco(blockchain.TipoBloco_Laudo, laudo)
+	}
+
 	go b.tentarDespachar()
 }
 
@@ -739,11 +753,17 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 		Payload:   string(payload),
 	}
 
+
+	b.mu.Lock()
+	b.missoesAtivas[oc.ID] = true // Registra que este broker é o responsável
+	b.mu.Unlock()
+
 	// Corrigido: O Broker age como cliente conectando à porta do servidor interno do Drone!
 	porta := "909" + string(droneID[len(droneID)-1])
 	addr := droneID + ":" + porta
 	var conn net.Conn
 	var err error
+	
 
 	cfg := &tls.Config{InsecureSkipVerify: true}
 	conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr, cfg)
@@ -852,8 +872,26 @@ func (b *Broker) handleNovoBloco(conn net.Conn, msg protocol.Mensagem) {
 		return
 	}
 
-	fmt.Printf("[Broker %s] [Chain] Bloco #%d recebido de %s. Votando...\n",
-		b.id, bloco.Indice, msg.IDOrigem)
+	ultimoBloco := b.chain.UltimoBloco()
+	if bloco.HashAnterior != ultimoBloco.Hash {
+		fmt.Printf("[Broker %s] [Chain] Desincronizado. Solicitando chain atualizada...\n", b.id)
+		b.solicitarChain()
+		return
+	}
+
+	fmt.Printf("[Broker %s] [Chain] Bloco #%d recebido de %s. Votando...\n", b.id, bloco.Indice, msg.IDOrigem)
+
+	b.mu.Lock()
+	// Garante que o bloco está inicializado nos pendentes
+	if _, ok := b.blocosPendentes[bloco.Hash]; !ok {
+		b.blocosPendentes[bloco.Hash] = bloco
+	}
+
+	// SOMA VOTOS: O do propositor (msg.IDOrigem) + o meu voto local (já validado)
+	b.votosBloco[bloco.Hash] += 2
+	votos := b.votosBloco[bloco.Hash]
+	total := len(b.connBrokers) + 1
+	b.mu.Unlock()
 
 	aceite := protocol.Mensagem{
 		Tipo:      protocol.TipoAceiteBloco,
@@ -861,11 +899,17 @@ func (b *Broker) handleNovoBloco(conn net.Conn, msg protocol.Mensagem) {
 		Timestamp: time.Now(),
 		Payload:   fmt.Sprintf(`{"hash":"%s"}`, bloco.Hash),
 	}
-	json.NewEncoder(conn).Encode(aceite)
 
-	b.mu.Lock()
-	b.blocosPendentes[bloco.Hash] = bloco
-	b.mu.Unlock()
+	peers := b.peersAtivos()
+	for _, peerConn := range peers {
+		json.NewEncoder(peerConn).Encode(aceite)
+	}
+
+	quorum := total/2 + 1
+	
+	if votos == quorum {
+		b.commitarBloco(bloco)
+	}
 }
 
 func (b *Broker) handleAceiteBloco(msg protocol.Mensagem) {
@@ -883,13 +927,14 @@ func (b *Broker) handleAceiteBloco(msg protocol.Mensagem) {
 	bloco, existe := b.blocosPendentes[payload.Hash]
 	b.mu.Unlock()
 
+	// Se não existe, o bloco já foi commitado
 	if !existe {
 		return
 	}
 
 	quorum := total/2 + 1
-	fmt.Printf("[Broker %s] [Chain] Aceite de %s para bloco #%d (%d/%d)\n",
-		b.id, msg.IDOrigem, bloco.Indice, votos, quorum)
+	fmt.Printf("[Broker %s] [Chain] Aceite de %s para hash %s (%d/%d)\n",
+		b.id, msg.IDOrigem, payload.Hash[:8], votos, quorum)
 
 	if votos == quorum {
 		b.commitarBloco(bloco)
@@ -897,16 +942,22 @@ func (b *Broker) handleAceiteBloco(msg protocol.Mensagem) {
 }
 
 func (b *Broker) commitarBloco(bloco blockchain.Bloco) {
+	b.mu.Lock()
+	// Se o bloco não estiver mais nos pendentes, é porque já foi commitado. Aborta.
+	if _, pendente := b.blocosPendentes[bloco.Hash]; !pendente {
+		b.mu.Unlock()
+		return 
+	}
+	// Remove das listas para garantir que o commit aconteça estritamente UMA vez
+	delete(b.votosBloco, bloco.Hash)
+	delete(b.blocosPendentes, bloco.Hash)
+	b.mu.Unlock()
+
 	if err := b.chain.CommitarBloco(bloco); err != nil {
 		fmt.Printf("[Broker %s] [Chain] Erro ao commitar bloco #%d: %v\n",
 			b.id, bloco.Indice, err)
 		return
 	}
-
-	b.mu.Lock()
-	delete(b.votosBloco, bloco.Hash)
-	delete(b.blocosPendentes, bloco.Hash)
-	b.mu.Unlock()
 
 	if bloco.TipoDados == blockchain.TipoBloco_Transacao {
 		var tx protocol.Transacao

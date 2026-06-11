@@ -1150,6 +1150,13 @@ func (b *Broker) encerrarSistema() {
 	b.mu.Unlock()
 
 	fmt.Printf("\n[Broker %s] Encerrando...\n", b.id)
+
+	if err := b.chain.SalvarChain(); err != nil {
+		fmt.Printf("[Broker %s] Aviso: falha ao persistir chain no encerramento: %v\n", b.id, err)
+	} else {
+		fmt.Printf("[Broker %s] Chain persistida com sucesso (%d blocos).\n", b.id, b.chain.Tamanho())
+	}
+
 	b.mu.Lock()
 	for _, c := range b.connBrokers {
 		c.Close()

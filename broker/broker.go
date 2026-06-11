@@ -311,6 +311,16 @@ func (b *Broker) handleConexao(conn net.Conn) {
 					Status:  "disponivel",
 					Bateria: 100,
 				}
+			} else {
+				if info.Endereco != "" {
+					d.Posicao = info.Endereco
+				}
+				// Força o status para disponivel independente de estar como "recarregando" ou "indisponivel"
+				// Isso garante que o Broker limpe o estado local assim que o drone se reconectar ativo
+				if d.Status != "disponivel" {
+					d.Status = "disponivel"
+					fmt.Printf("[Broker %s] Drone %s está pronto e disponível novamente\n", b.id, info.ID)
+				}
 			}
 			b.mu.Unlock()
 			fmt.Printf("[Broker %s] Drone %s registrado\n", b.id, info.ID)

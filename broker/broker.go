@@ -935,8 +935,7 @@ func (b *Broker) handleNovoBloco(conn net.Conn, msg protocol.Mensagem) {
 	}
 
 	quorum := total/2 + 1
-	
-	if votos == quorum {
+	if votos >= quorum {
 		b.commitarBloco(bloco)
 	}
 }

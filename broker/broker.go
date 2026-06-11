@@ -1086,6 +1086,24 @@ func (b *Broker) monitorarPeers() {
 			if b.requesting {
 				delete(b.respostasOK, id)
 				delete(b.deferred, id)
+
+				totalAtivos := 0
+				for key := range b.connBrokers {
+					if !strings.HasPrefix(key, "tester") {
+						totalAtivos++
+					}
+				}
+
+				// ---: Previne Double-CS em caso de queda simultânea de rede ---
+				if len(b.respostasOK) >= totalAtivos && totalAtivos > 0 {
+					b.requesting = false
+					oc := &protocol.Ocorrencia{
+						ID:         b.currentReqID,
+						Prioridade: b.currentReqRA.Prioridade,
+						Timestamp:  b.currentReqRA.Timestamp,
+					}
+					go b.entrarCS(oc)
+				}
 			}
 			b.mu.Unlock()
 		}

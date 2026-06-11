@@ -28,9 +28,28 @@ import (
 	"Strait-of-Hormuz-and-Maritime-Ledger/state"
 )
 
-// ============================================================
-// CONSTANTES
-// ============================================================
+type connSegura struct {
+	mu      sync.Mutex
+	conn    net.Conn
+	encoder *json.Encoder
+}
+
+func novaConnSegura(conn net.Conn) *connSegura {
+	return &connSegura{
+		conn:    conn,
+		encoder: json.NewEncoder(conn),
+	}
+}
+
+func (c *connSegura) enviar(msg protocol.Mensagem) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.encoder.Encode(msg)
+}
+
+func (c *connSegura) fechar() {
+	_ = c.conn.Close()
+}
 
 const (
 	intervaloGossip    = 2 * time.Second

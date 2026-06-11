@@ -1,16 +1,16 @@
 // ============================================================
-// BLOCKCHAIN — Ledger distribuído imutável
+// BLOCKCHAIN/PERSISTENCE — Persistência local da chain em disco
 //
 // Responsabilidades:
-//   - Manter a chain local de blocos encadeados por hash
-//   - Gerar e verificar hashes SHA-256
-//   - Gerenciar saldos de créditos das companhias (UTXO simplificado)
-//   - Validar transações (anti-duplo gasto)
-//   - Participar do consenso PoA (Proof of Authority):
-//       um broker propõe um bloco → broadcast para peers →
-//       maioria simples (>50%) aceita → bloco é commitado
+//   - Salvar a chain (blocos + saldos) em JSON no diretório /app/state
+//   - Carregar a chain ao iniciar, evitando recomeçar do zero
+//   - Cada nó usa um arquivo nomeado pelo seu ID (ex: chain_1.json)
+//     para suportar múltiplos brokers na mesma máquina
 //
-// Origem: totalmente novo no Problema 3.
+// Fluxo de uso:
+//   1. Na inicialização: CarregarChain → se vazio, cria gênesis
+//   2. A cada CommitarBloco bem-sucedido: SalvarChain
+//   3. No encerramento gracioso (SIGTERM): SalvarChain
 // ============================================================
 
 package blockchain
@@ -19,53 +19,147 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
 // ============================================================
+// PERSISTÊNCIA EM DISCO
+// ============================================================
+
+type snapshotDisco struct {
+	Blocos []Bloco        `json:"blocos"`
+	Saldos map[string]int `json:"saldos"`
+}
+
+func caminhoArquivo(brokerID string) string {
+	dir := os.Getenv("STATE_DIR")
+	if dir == "" {
+		dir = "/app/state"
+	}
+	return filepath.Join(dir, fmt.Sprintf("chain_%s.json", brokerID))
+}
+
+func (c *Chain) SalvarChain() error {
+	c.mu.RLock()
+	snapshot := snapshotDisco{
+		Blocos: make([]Bloco, len(c.Blocos)),
+		Saldos: make(map[string]int, len(c.Saldos)),
+	}
+	copy(snapshot.Blocos, c.Blocos)
+	for k, v := range c.Saldos {
+		snapshot.Saldos[k] = v
+	}
+	c.mu.RUnlock()
+
+	dados, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("erro ao serializar chain para disco: %w", err)
+	}
+
+	caminho := caminhoArquivo(c.DroneID)
+
+	tmp := caminho + ".tmp"
+	if err := os.WriteFile(tmp, dados, 0644); err != nil {
+		return fmt.Errorf("erro ao escrever arquivo temporário: %w", err)
+	}
+	if err := os.Rename(tmp, caminho); err != nil {
+		return fmt.Errorf("erro ao mover arquivo para destino final: %w", err)
+	}
+
+	fmt.Printf("[blockchain %s] Chain persistida: %d bloco(s) → %s\n",
+		c.DroneID, len(snapshot.Blocos), caminho)
+	return nil
+}
+
+func CarregarChain(brokerID string) (*snapshotDisco, error) {
+	caminho := caminhoArquivo(brokerID)
+
+	dados, err := os.ReadFile(caminho)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("[blockchain %s] Nenhum estado anterior encontrado. Iniciando do zero.\n", brokerID)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("erro ao ler arquivo de estado: %w", err)
+	}
+
+	var snapshot snapshotDisco
+	if err := json.Unmarshal(dados, &snapshot); err != nil {
+		return nil, fmt.Errorf("arquivo de estado corrompido (%s): %w", caminho, err)
+	}
+
+	fmt.Printf("[blockchain %s] Estado anterior encontrado: %d bloco(s) carregados de %s\n",
+		brokerID, len(snapshot.Blocos), caminho)
+	return &snapshot, nil
+}
+
+func RestaurarChain(brokerID string, snapshot *snapshotDisco) *Chain {
+	if snapshot == nil || len(snapshot.Blocos) == 0 {
+		return nil
+	}
+
+	c := &Chain{
+		Blocos:  snapshot.Blocos,
+		Saldos:  snapshot.Saldos,
+		DroneID: brokerID,
+	}
+
+	if !c.ValidarChain() {
+		fmt.Printf("[blockchain %s] AVISO: Chain carregada do disco é inválida. Descartando e reiniciando.\n", brokerID)
+		return nil
+	}
+
+	fmt.Printf("[blockchain %s] Chain restaurada com sucesso: %d bloco(s), saldos: %v\n",
+		brokerID, len(c.Blocos), c.Saldos)
+	return c
+}
+
+// ============================================================
 // ESTRUTURAS
 // ============================================================
 
-// TipoDados identifica o conteúdo do bloco.
 type TipoDados string
 
 const (
-	TipoBloco_Transacao TipoDados = "TRANSACAO" // Pagamento de créditos
-	TipoBloco_Laudo     TipoDados = "LAUDO"     // Relatório de missão concluída
-	TipoBloco_Genesis   TipoDados = "GENESIS"   // Bloco inicial da cadeia
+	TipoBloco_Transacao TipoDados = "TRANSACAO"
+	TipoBloco_Laudo     TipoDados = "LAUDO"
+	TipoBloco_Genesis   TipoDados = "GENESIS"
 )
 
-// Bloco é a unidade atômica do ledger.
-// O encadeamento de hashes torna qualquer adulteração detectável:
-// alterar dados de um bloco invalida seu hash e, consequentemente,
-// o campo HashAnterior de todos os blocos seguintes.
 type Bloco struct {
 	Indice       int       `json:"indice"`
 	Timestamp    time.Time `json:"timestamp"`
 	TipoDados    TipoDados `json:"tipo_dados"`
-	Dados        string    `json:"dados"` // JSON do payload (Transacao ou Laudo)
+	Dados        string    `json:"dados"`
 	HashAnterior string    `json:"hash_anterior"`
 	Hash         string    `json:"hash"`
-	Validador    string    `json:"validador"` // ID do broker que propôs o bloco
+	Validador    string    `json:"validador"`
 }
 
-// Chain é a estrutura local do ledger de um nó.
 type Chain struct {
 	mu      sync.RWMutex
-	Blocos  []Bloco        // Cadeia de blocos em ordem
-	Saldos  map[string]int // saldos[companhiaID] = créditos disponíveis
-	DroneID string         // ID do broker dono desta chain (para logs)
+	Blocos  []Bloco
+	Saldos  map[string]int
+	DroneID string
 }
 
 // ============================================================
 // INICIALIZAÇÃO
 // ============================================================
 
-// NovaChain cria uma chain com bloco gênesis e saldos iniciais das companhias.
-// saldosIniciais permite configurar cada companhia com créditos ao iniciar.
-// NovaChain cria uma chain com bloco gênesis estático e saldos iniciais.
 func NovaChain(brokerID string, saldosIniciais map[string]int) *Chain {
+	snapshot, err := CarregarChain(brokerID)
+	if err != nil {
+		fmt.Printf("[blockchain %s] Erro ao carregar estado do disco: %v. Iniciando do zero.\n", brokerID, err)
+	} else if snapshot != nil {
+		if restaurada := RestaurarChain(brokerID, snapshot); restaurada != nil {
+			return restaurada
+		}
+	}
+
 	c := &Chain{
 		Saldos:  make(map[string]int),
 		DroneID: brokerID,
@@ -75,7 +169,6 @@ func NovaChain(brokerID string, saldosIniciais map[string]int) *Chain {
 		c.Saldos[k] = v
 	}
 
-	// GÊNESIS DETERMINÍSTICO: Todos os brokers geram exatamente o mesmo bloco
 	timestampGenesis, _ := time.Parse(time.RFC3339, "2026-01-01T00:00:00Z")
 
 	genesis := Bloco{
@@ -89,17 +182,19 @@ func NovaChain(brokerID string, saldosIniciais map[string]int) *Chain {
 	genesis.Hash = calcularHash(genesis)
 	c.Blocos = append(c.Blocos, genesis)
 
-	fmt.Printf("[blockchain %s] Chain iniciada. Bloco gênesis: %s\n", brokerID, genesis.Hash[:16])
+	fmt.Printf("[blockchain %s] Chain iniciada do zero. Bloco gênesis: %s\n", brokerID, genesis.Hash[:16])
+
+	if err := c.SalvarChain(); err != nil {
+		fmt.Printf("[blockchain %s] Aviso: falha ao persistir estado inicial: %v\n", brokerID, err)
+	}
+
 	return c
 }
 
 // ============================================================
-// HASH
+// HASH E BLOCOS
 // ============================================================
 
-// calcularHash gera o SHA-256 de um bloco.
-// O hash depende de índice, timestamp, tipo, dados, hash anterior e validador —
-// qualquer alteração em qualquer campo produz um hash completamente diferente.
 func calcularHash(b Bloco) string {
 	entrada := fmt.Sprintf("%d%s%s%s%s%s",
 		b.Indice,
@@ -113,12 +208,6 @@ func calcularHash(b Bloco) string {
 	return fmt.Sprintf("%x", h)
 }
 
-// ============================================================
-// ADIÇÃO DE BLOCOS
-// ============================================================
-
-// ProporBloco cria um novo bloco candidato a ser adicionado à chain.
-// O bloco ainda não é commitado — ele precisa passar pelo consenso PoA.
 func (c *Chain) ProporBloco(tipoDados TipoDados, dados interface{}, validador string) (Bloco, error) {
 	dadosJSON, err := json.Marshal(dados)
 	if err != nil {
@@ -143,50 +232,51 @@ func (c *Chain) ProporBloco(tipoDados TipoDados, dados interface{}, validador st
 	return novo, nil
 }
 
-// CommitarBloco adiciona um bloco já aprovado pelo consenso à chain local.
-// Valida a integridade antes de aceitar.
-// Retorna erro se o bloco for inválido (adulterado ou fora de sequência).
 func (c *Chain) CommitarBloco(b Bloco) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	ultimo := c.Blocos[len(c.Blocos)-1]
 
-	// Verifica encadeamento
 	if b.Indice != ultimo.Indice+1 {
+		c.mu.Unlock() // Libera antes de retornar erro
 		return fmt.Errorf("índice inválido: esperado %d, recebido %d", ultimo.Indice+1, b.Indice)
 	}
 	if b.HashAnterior != ultimo.Hash {
+		c.mu.Unlock() // Libera antes de retornar erro
 		return fmt.Errorf("hash anterior inválido: esperado %s, recebido %s", ultimo.Hash[:16], b.HashAnterior[:16])
 	}
 
-	// Verifica integridade do bloco em si
 	hashCalculado := calcularHash(b)
 	if hashCalculado != b.Hash {
+		c.mu.Unlock() // Libera antes de retornar erro
 		return fmt.Errorf("hash do bloco adulterado: calculado %s, recebido %s", hashCalculado[:16], b.Hash[:16])
 	}
 
 	c.Blocos = append(c.Blocos, b)
 	fmt.Printf("[blockchain %s] Bloco #%d commitado. Hash: %s | Tipo: %s\n",
 		c.DroneID, b.Indice, b.Hash[:16], b.TipoDados)
+
+	c.mu.Unlock() // <-- CORREÇÃO AQUI: Libera o lock ANTES de chamar SalvarChain
+
+	// Agora é seguro chamar SalvarChain (que exige o RLock internamente)
+	if err := c.SalvarChain(); err != nil {
+		fmt.Printf("[blockchain %s] AVISO: falha ao persistir após commit do bloco #%d: %v\n",
+			c.DroneID, b.Indice, err)
+	}
+
 	return nil
 }
 
 // ============================================================
-// GESTÃO DE CRÉDITOS (anti-duplo gasto)
+// GESTÃO DE CRÉDITOS E TRANSAÇÕES
 // ============================================================
 
-// ConsultarSaldo retorna o saldo atual de uma companhia.
 func (c *Chain) ConsultarSaldo(companhiaID string) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Saldos[companhiaID]
 }
 
-// ValidarTransacao verifica se a companhia tem saldo suficiente.
-// Retorna false se não houver saldo ou se os créditos forem inválidos.
-// Esta verificação é feita ANTES de entrar na região crítica (Ricart-Agrawala),
-// evitando disputas desnecessárias por drones quando o pagamento falharia.
 func (c *Chain) ValidarTransacao(companhiaID string, creditos int) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -205,9 +295,6 @@ func (c *Chain) ValidarTransacao(companhiaID string, creditos int) error {
 	return nil
 }
 
-// DebitarCreditos subtrai créditos do saldo de uma companhia.
-// Deve ser chamado SOMENTE após CommitarBloco de uma transação válida,
-// garantindo que o débito está registrado imutavelmente antes de ser efetivado.
 func (c *Chain) DebitarCreditos(companhiaID string, creditos int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -225,7 +312,6 @@ func (c *Chain) DebitarCreditos(companhiaID string, creditos int) error {
 	return nil
 }
 
-// CreditarSaldo adiciona créditos à conta de uma companhia (recarga ou devolução).
 func (c *Chain) CreditarSaldo(companhiaID string, creditos int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -238,9 +324,6 @@ func (c *Chain) CreditarSaldo(companhiaID string, creditos int) {
 // VALIDAÇÃO E SINCRONIZAÇÃO
 // ============================================================
 
-// ValidarChain verifica a integridade completa da cadeia local.
-// Percorre todos os blocos e garante que hashes estão corretos e encadeados.
-// Usado ao receber uma chain de outro nó para detectar adulterações.
 func (c *Chain) ValidarChain() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -249,14 +332,12 @@ func (c *Chain) ValidarChain() bool {
 		atual := c.Blocos[i]
 		anterior := c.Blocos[i-1]
 
-		// Verifica encadeamento de hashes
 		if atual.HashAnterior != anterior.Hash {
 			fmt.Printf("[blockchain %s] ADULTERAÇÃO detectada no bloco #%d: hash anterior não bate\n",
 				c.DroneID, atual.Indice)
 			return false
 		}
 
-		// Verifica integridade do hash do bloco atual
 		if calcularHash(atual) != atual.Hash {
 			fmt.Printf("[blockchain %s] ADULTERAÇÃO detectada no bloco #%d: hash adulterado\n",
 				c.DroneID, atual.Indice)
@@ -266,19 +347,14 @@ func (c *Chain) ValidarChain() bool {
 	return true
 }
 
-// SubstituirChain substitui a chain local por uma chain recebida de outro nó,
-// mas somente se a chain recebida for mais longa E válida.
-// É o mecanismo de sincronização ao reconectar ao cluster.
-// Também reconstrói os saldos replaying todas as transações da nova chain.
 func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if len(nova) <= len(c.Blocos) {
-		return false // Chain recebida não é mais longa, ignorar
+		return false
 	}
 
-	// Valida a chain recebida antes de aceitar
 	for i := 1; i < len(nova); i++ {
 		if nova[i].HashAnterior != nova[i-1].Hash {
 			fmt.Printf("[blockchain %s] Chain recebida inválida no bloco #%d\n", c.DroneID, i)
@@ -292,7 +368,6 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 
 	c.Blocos = nova
 
-	// Reconstrói saldos a partir do zero replaying transações
 	for k, v := range saldosIniciais {
 		c.Saldos[k] = v
 	}
@@ -309,14 +384,20 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 	}
 
 	fmt.Printf("[blockchain %s] Chain substituída por chain com %d blocos\n", c.DroneID, len(nova))
+
+	go func() {
+		if err := c.SalvarChain(); err != nil {
+			fmt.Printf("[blockchain %s] Aviso: falha ao persistir após substituição de chain: %v\n", c.DroneID, err)
+		}
+	}()
+
 	return true
 }
 
 // ============================================================
-// SERIALIZAÇÃO
+// SERIALIZAÇÃO E UTILITÁRIOS
 // ============================================================
 
-// SerializarChain converte a chain local em JSON para transmissão.
 func (c *Chain) SerializarChain() (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -328,7 +409,6 @@ func (c *Chain) SerializarChain() (string, error) {
 	return string(dados), nil
 }
 
-// SerializarSaldos converte o mapa de saldos em JSON para transmissão.
 func (c *Chain) SerializarSaldos() (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -340,14 +420,12 @@ func (c *Chain) SerializarSaldos() (string, error) {
 	return string(dados), nil
 }
 
-// Tamanho retorna o número de blocos na chain (incluindo gênesis).
 func (c *Chain) Tamanho() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.Blocos)
 }
 
-// UltimoBloco retorna uma cópia do bloco mais recente da chain.
 func (c *Chain) UltimoBloco() Bloco {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

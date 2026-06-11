@@ -36,6 +36,7 @@ const (
 	intervaloGossip    = 2 * time.Second
 	intervaloHeartbeat = 5 * time.Second
 	timeoutHeartbeat   = 12 * time.Second
+	tempoMaximoFila    = 2 * time.Minute
 	creditosIniciais   = 100
 	custoEscolta       = 10
 )
@@ -65,6 +66,7 @@ type Broker struct {
 	inCS         bool
 	currentReqID string
 	currentReqRA protocol.RequisicaoRA
+	currentOc    *protocol.Ocorrencia
 	respostasOK  map[string]bool
 	deferred     map[string]bool
 
@@ -503,30 +505,57 @@ func (b *Broker) tentarDespachar() {
 	livres := b.dronesLivres()
 	totalNos := len(b.mapaRede)
 
-	if livres >= totalNos {
-		oc := b.fila.Pop()
-		b.mu.Unlock()
-		if oc != nil {
-			b.despacharDrone(oc)
-			go b.tentarDespachar()
+	// === Loop de busca com Lazy Evaluation para expiração ===
+	var oc *protocol.Ocorrencia
+	for {
+		oc = b.fila.Pop()
+		if oc == nil {
+			// Fila esvaziou
+			break
 		}
-		return
+
+		// Checa se a ocorrência "venceu"
+		if time.Since(oc.Timestamp) > tempoMaximoFila {
+			fmt.Printf("[Broker %s] ⏳ Ocorrência %s expirou após %v na fila. Cancelando...\n", 
+				b.id, oc.ID, tempoMaximoFila)
+			
+			// Libera o saldo cativo para que a companhia possa usar novamentetentarDespactentarDespacharhar
+			if oc.Solicitante != "" {
+				b.chain.LiberarSaldoBloqueado(oc.Solicitante, oc.Creditos)
+			}
+			continue // Puxa a próxima ocorrência da fila
+		}
+
+		// Se achou uma válida e dentro da validade, sai do loop
+		break
 	}
 
-	if b.requesting || b.inCS || livres == 0 {
-		b.mu.Unlock()
-		return
-	}
-
-	oc := b.fila.Pop()
+	// Se esvaziou a fila inteira só com itens expirados, aborta o despacho
 	if oc == nil {
 		b.mu.Unlock()
 		return
 	}
+	// ==============================================================
 
+	if livres >= totalNos {
+		b.mu.Unlock()
+		b.despacharDrone(oc)
+		go b.tentarDespachar()
+		return
+	}
+
+	if b.requesting || b.inCS || livres == 0 {
+		// Se não posso processar agora, devolvo a ocorrência válida para a fila
+		b.fila.Push(oc) 
+		b.mu.Unlock()
+		return
+	}
+
+	// Continua o fluxo normal do Ricart-Agrawala...
 	b.relogioLocal++
 	b.requesting = true
 	b.currentReqID = oc.ID
+	b.currentOc = oc
 	b.currentReqRA = protocol.RequisicaoRA{
 		BrokerID:   b.id,
 		Relogio:    b.relogioLocal,
@@ -620,12 +649,7 @@ func (b *Broker) handleRAOK(msg protocol.Mensagem) {
 	b.respostasOK[msg.IDOrigem] = true
 	recebidos := len(b.respostasOK)
 	necessario := b.quorumRA()
-	ocID := b.currentReqID
-	oc := &protocol.Ocorrencia{
-		ID:         ocID,
-		Prioridade: b.currentReqRA.Prioridade,
-		Timestamp:  b.currentReqRA.Timestamp,
-	}
+	oc := b.currentOc
 	b.mu.Unlock()
 
 	fmt.Printf("[Broker %s] [RA] OK de %s (%d/%d)\n",
@@ -728,18 +752,6 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 	}
 	b.mu.Unlock()
 
-	if oc.Solicitante != "" {
-		tx := protocol.Transacao{
-			ID:           fmt.Sprintf("TX-%s-%d", oc.ID, time.Now().UnixNano()),
-			De:           oc.Solicitante,
-			Para:         "sistema",
-			Creditos:     oc.Creditos,
-			OcorrenciaID: oc.ID,
-			Timestamp:    time.Now(),
-		}
-		go b.proporBloco(blockchain.TipoBloco_Transacao, tx)
-	}
-
 	cmd := protocol.ComandoMissao{
 		OcorrenciaID: oc.ID,
 		Descricao:    oc.Descricao,
@@ -807,12 +819,29 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 
 			// Roda a roleta de novo
 			go b.tentarDespachar()
-			return // Sai para não printar a mensagem de sucesso
+			return // Sai para não propor o bloco de cobrança!
 		}
 
+		// ==========================================
+		// SUCESSO: O DRONE ACEITOU A MISSÃO
+		// ==========================================
 		fmt.Printf("[Broker %s] ✈  Drone %s → ocorrência %s (P%d)\n", b.id, droneID, oc.ID, oc.Prioridade)
+
+		// AGORA SIM, propomos o bloco de transação para debitar os créditos
+		if oc.Solicitante != "" {
+			tx := protocol.Transacao{
+				ID:           fmt.Sprintf("TX-%s-%d", oc.ID, time.Now().UnixNano()),
+				De:           oc.Solicitante,
+				Para:         "sistema",
+				Creditos:     oc.Creditos,
+				OcorrenciaID: oc.ID,
+				Timestamp:    time.Now(),
+			}
+			go b.proporBloco(blockchain.TipoBloco_Transacao, tx)
+		}
+
 	} else {
-        // Se falhar a conexão, a ocorrência também deve voltar para a fila!
+		// Se falhar a conexão TCP, devolve à fila 
 		fmt.Printf("[Broker %s] Falha de rede com drone %s: %v. Devolvendo à fila.\n", b.id, droneID, err)
 		b.mu.Lock()
 		b.fila.Push(oc)
@@ -820,9 +849,6 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 
 		go b.tentarDespachar()
 	}
-
-	fmt.Printf("[Broker %s] ✈  Drone %s → ocorrência %s (P%d)\n",
-		b.id, droneID, oc.ID, oc.Prioridade)
 }
 
 // ============================================================

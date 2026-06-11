@@ -1,19 +1,3 @@
-// ============================================================
-// TESTER — Ferramenta de diagnóstico e stress-test
-//
-// Baseado no tester de Daniel, adaptado para o novo envelope de protocolo.
-// Conecta-se como peer broker (entra no mapa de brokers do cluster)
-// e permite observar o Ricart-Agrawala em tempo real, medir latência
-// RTT, e injetar múltiplas requisições simultâneas.
-//
-// Adicionado no Problema 3:
-//   - Comando "chain <addr>"             → exibe todos os blocos da chain
-//   - Comando "saldo <addr> <companhia>" → consulta créditos de uma companhia
-//   - Comando "watch <on|off>"           → log em tempo real do consenso de blocos
-//
-// Uso: tester [broker1:9081] [broker2:9082] ...
-// ============================================================
-
 package main
 
 import (
@@ -32,13 +16,6 @@ import (
 	"Strait-of-Hormuz-and-Maritime-Ledger/protocol"
 )
 
-// ============================================================
-// STRUCTS
-// ============================================================
-
-// connSegura encapsula uma conexão com um encoder exclusivo e mutex próprio.
-// Isso garante que apenas um goroutine escreve por vez nessa conn,
-// evitando intercalamento de JSON quando heartbeat, req e OK disputam o socket.
 type connSegura struct {
 	mu      sync.Mutex
 	conn    net.Conn
@@ -59,22 +36,19 @@ func (c *connSegura) enviar(msg protocol.Mensagem) error {
 }
 
 func (c *connSegura) fechar() {
-	c.conn.Close()
+	_ = c.conn.Close()
 }
 
 type Tester struct {
-	mu      sync.Mutex
-	id      string
-	conns   map[string]*connSegura // addr → connSegura
-	relogio int64
-	// Canal onde chegam todas as mensagens dos brokers
-	incoming chan mensagemRecebida
-	autoOK   bool
-	pong     chan mensagemRecebida
-	// OKs pendentes de envio manual
-	pendentes map[string]string // brokerID → addr
+	mu        sync.Mutex
+	id        string
+	conns     map[string]*connSegura
+	relogio   int64
+	incoming  chan mensagemRecebida
+	autoOK    bool
+	pong      chan mensagemRecebida
+	pendentes map[string]string
 
-	// ---- Blockchain monitoring ----------------------------------
 	watchBloco bool
 	respChain  chan mensagemRecebida
 	respSaldo  chan mensagemRecebida
@@ -85,30 +59,23 @@ type mensagemRecebida struct {
 	msg  protocol.Mensagem
 }
 
-// ============================================================
-// INICIALIZAÇÃO
-// ============================================================
-
 func novoTester(addrs []string) *Tester {
 	t := &Tester{
-		id:        fmt.Sprintf("tester-%d", time.Now().UnixNano()%10000),
-		conns:     make(map[string]*connSegura),
-		incoming:  make(chan mensagemRecebida, 256),
-		autoOK:    true,
-		pong:      make(chan mensagemRecebida, 1),
-		pendentes: make(map[string]string),
-		respChain: make(chan mensagemRecebida, 4),
-		respSaldo: make(chan mensagemRecebida, 4),
+		id:         fmt.Sprintf("tester-%d", time.Now().UnixNano()%10000),
+		conns:      make(map[string]*connSegura),
+		incoming:   make(chan mensagemRecebida, 256),
+		autoOK:     true,
+		pong:       make(chan mensagemRecebida, 1),
+		pendentes:  make(map[string]string),
+		respChain:  make(chan mensagemRecebida, 4),
+		respSaldo:  make(chan mensagemRecebida, 4),
+		watchBloco: false,
 	}
 	for _, addr := range addrs {
 		t.conectar(addr)
 	}
 	return t
 }
-
-// ============================================================
-// CONEXÃO TLS
-// ============================================================
 
 func (t *Tester) conectar(addr string) {
 	cfg := &tls.Config{InsecureSkipVerify: true}
@@ -128,11 +95,9 @@ func (t *Tester) conectar(addr string) {
 func (t *Tester) registrarConn(addr string, rawConn net.Conn) {
 	cs := novaConnSegura(rawConn)
 
-	// Handshake: apresenta-se como broker para entrar no connBrokers do cluster
-	// e receber todos os broadcasts (RARequest, NovoBloco, AceiteBloco etc.)
 	info := protocol.InfoConexao{Tipo: "broker", ID: t.id}
 	payload, _ := json.Marshal(info)
-	cs.enviar(protocol.Mensagem{
+	_ = cs.enviar(protocol.Mensagem{
 		Tipo:      protocol.TipoHandshake,
 		IDOrigem:  t.id,
 		Timestamp: time.Now(),
@@ -149,8 +114,6 @@ func (t *Tester) registrarConn(addr string, rawConn net.Conn) {
 	go t.heartbeat(addr, cs)
 }
 
-// heartbeat mantém a conexão viva e atualiza ultimoHB do broker.
-// Usa o connSegura para não disputar o socket com outros goroutines.
 func (t *Tester) heartbeat(addr string, cs *connSegura) {
 	ticker := time.NewTicker(4 * time.Second)
 	defer ticker.Stop()
@@ -171,21 +134,18 @@ func (t *Tester) heartbeat(addr string, cs *connSegura) {
 	}
 }
 
+// CORRIGIDO: Usa Decoder para não comer o arquivo inteiro do RespChain no Buffer
 func (t *Tester) receberMensagens(addr string, cs *connSegura) {
-	scanner := bufio.NewScanner(cs.conn)
-	for scanner.Scan() {
+	dec := json.NewDecoder(cs.conn)
+	for {
 		var msg protocol.Mensagem
-		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
-			continue
+		if err := dec.Decode(&msg); err != nil {
+			break
 		}
 		t.incoming <- mensagemRecebida{addr: addr, msg: msg}
 	}
 	fmt.Printf("[TESTER] Conexão com %s encerrada\n", addr)
 }
-
-// ============================================================
-// LOOP DE EVENTOS
-// ============================================================
 
 func (t *Tester) processar() {
 	for recv := range t.incoming {
@@ -193,10 +153,9 @@ func (t *Tester) processar() {
 		addr := recv.addr
 
 		switch msg.Tipo {
-
 		case protocol.TipoRARequest:
 			var req protocol.RequisicaoRA
-			json.Unmarshal([]byte(msg.Payload), &req)
+			_ = json.Unmarshal([]byte(msg.Payload), &req)
 			fmt.Printf("\n[RA] REQUEST  broker=%-10s  prio=%-3d  relógio=%-8d  origem=%s  (via %s)\n",
 				req.BrokerID, req.Prioridade, req.Relogio, req.Origem, addr)
 
@@ -222,7 +181,6 @@ func (t *Tester) processar() {
 			}
 
 		case protocol.TipoHeartbeat:
-			// Broker mandou heartbeat → responde com pong pelo mesmo connSegura
 			t.mu.Lock()
 			cs, ok := t.conns[addr]
 			t.mu.Unlock()
@@ -236,8 +194,6 @@ func (t *Tester) processar() {
 
 		case protocol.TipoSyncEstado:
 			fmt.Printf("[TESTER] SYNC recebido de %s\n", msg.IDOrigem)
-
-		// ---- Blockchain: consenso ao vivo ----------------------
 
 		case protocol.TipoNovoBloco:
 			t.mu.Lock()
@@ -273,8 +229,6 @@ func (t *Tester) processar() {
 				}
 			}
 
-		// ---- Blockchain: respostas a comandos do tester --------
-
 		case protocol.TipoRespChain:
 			select {
 			case t.respChain <- recv:
@@ -290,21 +244,12 @@ func (t *Tester) processar() {
 	}
 }
 
-// ============================================================
-// HELPERS DE ENVIO
-// ============================================================
-
-// connPara retorna o connSegura para um addr, já com lock.
 func (t *Tester) connPara(addr string) (*connSegura, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	cs, ok := t.conns[addr]
 	return cs, ok
 }
-
-// ============================================================
-// COMANDOS
-// ============================================================
 
 func (t *Tester) ping(addr string) {
 	cs, ok := t.connPara(addr)
@@ -313,7 +258,6 @@ func (t *Tester) ping(addr string) {
 		return
 	}
 
-	// Drena pongs antigos antes de começar
 	for len(t.pong) > 0 {
 		<-t.pong
 	}
@@ -323,7 +267,7 @@ func (t *Tester) ping(addr string) {
 
 	for i := 0; i < count; i++ {
 		t0 := time.Now()
-		cs.enviar(protocol.Mensagem{
+		_ = cs.enviar(protocol.Mensagem{
 			Tipo:      protocol.TipoHeartbeat,
 			IDOrigem:  t.id,
 			Timestamp: time.Now(),
@@ -357,7 +301,6 @@ func (t *Tester) ping(addr string) {
 	}
 }
 
-// enviarRequisicao injeta uma ocorrência no broker com a prioridade dada.
 func (t *Tester) enviarRequisicao(addr string, prioridade int, n int, companhia string) {
 	cs, ok := t.connPara(addr)
 	if !ok {
@@ -401,7 +344,7 @@ func (t *Tester) enviarRAOK(addr, brokerID string) {
 	if !ok {
 		return
 	}
-	cs.enviar(protocol.Mensagem{
+	_ = cs.enviar(protocol.Mensagem{
 		Tipo:      protocol.TipoRAOK,
 		IDOrigem:  t.id,
 		Timestamp: time.Now(),
@@ -409,11 +352,6 @@ func (t *Tester) enviarRAOK(addr, brokerID string) {
 	fmt.Printf("[RA] OK enviado para broker=%s\n", brokerID)
 }
 
-// ============================================================
-// BLOCKCHAIN — COMANDOS
-// ============================================================
-
-// consultarChain solicita a chain completa a um broker e exibe os blocos.
 func (t *Tester) consultarChain(addr string) {
 	cs, ok := t.connPara(addr)
 	if !ok {
@@ -421,7 +359,6 @@ func (t *Tester) consultarChain(addr string) {
 		return
 	}
 
-	// Drena respostas antigas antes de enviar nova solicitação
 	for len(t.respChain) > 0 {
 		<-t.respChain
 	}
@@ -443,7 +380,6 @@ func (t *Tester) consultarChain(addr string) {
 	}
 }
 
-// exibirChain imprime um resumo legível de cada bloco da chain.
 func (t *Tester) exibirChain(msg protocol.Mensagem) {
 	var blocos []blockchain.Bloco
 	if err := json.Unmarshal([]byte(msg.Payload), &blocos); err != nil {
@@ -497,8 +433,6 @@ func (t *Tester) exibirChain(msg protocol.Mensagem) {
 	fmt.Printf("╚══════════════════════════════════════════════════════════════════╝\n")
 }
 
-// consultarSaldo solicita o saldo de uma companhia a um broker específico.
-// O broker usa msg.IDOrigem como identificador da companhia (ver handleConsultaSaldo).
 func (t *Tester) consultarSaldo(addr, companhia string) {
 	cs, ok := t.connPara(addr)
 	if !ok {
@@ -506,14 +440,13 @@ func (t *Tester) consultarSaldo(addr, companhia string) {
 		return
 	}
 
-	// Drena respostas antigas antes de enviar nova solicitação
 	for len(t.respSaldo) > 0 {
 		<-t.respSaldo
 	}
 
 	if err := cs.enviar(protocol.Mensagem{
 		Tipo:      protocol.TipoConsultaSaldo,
-		IDOrigem:  companhia, // broker usa IDOrigem como ID da companhia a consultar
+		IDOrigem:  companhia,
 		Timestamp: time.Now(),
 	}); err != nil {
 		fmt.Printf("[TESTER] erro ao solicitar saldo: %v\n", err)
@@ -536,10 +469,6 @@ func (t *Tester) consultarSaldo(addr, companhia string) {
 		fmt.Println("[SALDO] timeout aguardando resposta do broker")
 	}
 }
-
-// ============================================================
-// CLI
-// ============================================================
 
 func (t *Tester) cli() {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -566,7 +495,6 @@ func (t *Tester) cli() {
 		}
 
 		switch partes[0] {
-
 		case "ping":
 			if len(partes) < 2 {
 				fmt.Println("uso: ping <addr>")
@@ -669,10 +597,6 @@ func (t *Tester) cli() {
 		fmt.Print("> ")
 	}
 }
-
-// ============================================================
-// MAIN
-// ============================================================
 
 func main() {
 	if len(os.Args) < 2 {

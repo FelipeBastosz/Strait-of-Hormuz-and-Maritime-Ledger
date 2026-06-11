@@ -5,7 +5,7 @@
 // É serializado em JSON e enviado pelo coordenador via TipoSyncEstado
 // a cada 2 segundos para manter todos os brokers sincronizados.
 //
-// Origem: persistence.go de Felipe.
+//
 // ============================================================
 
 package state

@@ -141,6 +141,7 @@ type RequisicaoRA struct {
 
 // InfoConexao é enviada como primeira mensagem por qualquer componente ao conectar.
 type InfoConexao struct {
-	Tipo string `json:"tipo"` // "broker" | "drone" | "sensor" | "cliente"
-	ID   string `json:"id"`
+	Tipo     string `json:"tipo"` // "broker" | "drone" | "sensor" | "cliente"
+	ID       string `json:"id"`
+	Endereco string `json:"endereco"` // Endereço TCP onde o drone aceita comandos (ex: "drone1:9091")
 }

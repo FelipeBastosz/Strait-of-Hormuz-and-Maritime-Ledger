@@ -45,6 +45,7 @@ services:
     command: ["1"]
     environment:
       CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
     volumes:
       - state-broker1:/app/state
       - ./config.json:/app/config.json:ro
@@ -61,6 +62,7 @@ services:
     command: ["2"]
     environment:
       CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
     volumes:
       - state-broker2:/app/state
       - ./config.json:/app/config.json:ro
@@ -77,6 +79,7 @@ services:
     command: ["3"]
     environment:
       CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
     volumes:
       - state-broker3:/app/state
       - ./config.json:/app/config.json:ro
@@ -93,6 +96,7 @@ services:
     command: ["4"]
     environment:
       CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
     volumes:
       - state-broker4:/app/state
       - ./config.json:/app/config.json:ro

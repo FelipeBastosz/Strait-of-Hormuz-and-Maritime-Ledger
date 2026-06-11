@@ -1,24 +1,10 @@
-// ============================================================
-// DRONE — Drone autônomo de monitoramento
-//
-// Baseado no drone de Felipe, adaptado com:
-//   - TLS em todas as conexões TCP (Daniel)
-//   - Handshake de identificação ao conectar (Daniel)
-//   - Envio de Laudo estruturado ao concluir missão (Problema 3)
-//   - Fallback para outros brokers se o principal cair (Felipe)
-//   - Recarrega e re-registra automaticamente após bateria baixa (Felipe)
-//
-// Argumentos: [ID_DRONE] [ENDERECO_PROPRIO] [ENDERECO_BROKER]
-// Exemplo:    drone1 drone1:9091 broker1:9081
-// ============================================================
-
 package main
 
 import (
-	"bufio"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -30,14 +16,13 @@ import (
 	"Strait-of-Hormuz-and-Maritime-Ledger/protocol"
 )
 
-// Drone representa um drone físico de monitoramento focado em comunicação descentralizada.
 type Drone struct {
 	ID       string
-	Endereco string   // Endereço TCP público do próprio drone (ex: "drone1:9091")
-	Status   string   // "disponivel" | "em_missao" | "recarregando"
+	Endereco string
+	Status   string
 	Bateria  int
 	mu       sync.Mutex
-	Brokers  []string // Lista completa de brokers do cluster (sem broker principal único)
+	Brokers  []string
 }
 
 func main() {
@@ -47,7 +32,6 @@ func main() {
 		return
 	}
 
-	// Inicializa a lista de brokers com o broker fornecido por argumento
 	brokerInicial := os.Args[3]
 	drone := &Drone{
 		ID:       os.Args[1],
@@ -61,8 +45,7 @@ func main() {
 	if configPath == "" {
 		configPath = "/app/config.json"
 	}
-	
-	// Carrega os demais brokers do cluster e mescla evitando duplicatas
+
 	if brokersDoCluster, err := carregarBrokers(configPath); err == nil {
 		mapaAux := make(map[string]bool)
 		mapaAux[brokerInicial] = true
@@ -76,23 +59,12 @@ func main() {
 
 	rand.Seed(time.Now().UnixNano())
 
-	// Inicializa o servidor interno do drone para receber comandos
 	go drone.escutar()
-
-	// Tempo para o servidor estabilizar antes do primeiro registro
 	time.Sleep(3 * time.Second)
-	
-	// Registra a presença em todo o cluster simultaneamente
 	drone.registrarNosBrokers()
 
-	// O loop de re-registro periódico foi removido. 
-	// O ciclo de vida agora é guiado por eventos e transmissões ativas.
 	select {}
 }
-
-// ============================================================
-// SERVIDOR TLS DO DRONE
-// ============================================================
 
 func (d *Drone) escutar() {
 	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
@@ -115,6 +87,8 @@ func (d *Drone) escutar() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			// CRÍTICO: Se o SO esgotar recursos (too many open files), evita travar a CPU em 100%
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		go d.processarComando(conn)
@@ -133,70 +107,65 @@ func (d *Drone) escutarTCP() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		go d.processarComando(conn)
 	}
 }
 
-// ============================================================
-// PROCESSAMENTO DE COMANDOS
-// ============================================================
-
 func (d *Drone) processarComando(conn net.Conn) {
 	defer conn.Close()
-	scanner := bufio.NewScanner(conn)
+	dec := json.NewDecoder(conn)
+	enc := json.NewEncoder(conn)
 
-	for scanner.Scan() {
+	for {
 		var msg protocol.Mensagem
-		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
-			continue
+		if err := dec.Decode(&msg); err != nil {
+			if err != io.EOF {
+				// Ignora logs de EOF para não sujar o terminal
+			}
+			break
 		}
 
 		switch msg.Tipo {
 		case protocol.TipoComandoDrone:
 			d.mu.Lock()
-
 			if d.Status != "disponivel" {
-				fmt.Printf("[Drone %s] Recusei missão — status: %s\n", d.ID, d.Status)
+				statusLocal := d.Status
 				d.mu.Unlock()
-				
-				// NOVO: Tem que mandar o JSON avisando o broker da rejeição!
-				rejeicao := map[string]interface{}{
-					"acao": "rejeitado",
+
+				fmt.Printf("[Drone %s] Recusei missão — status atual: %s\n", d.ID, statusLocal)
+
+				// DEFESA: Rate Limit contra o Broker. Segura a conexão para impedir loops infinitos
+				if statusLocal == "recarregando" || statusLocal == "em_missao" {
+					time.Sleep(2 * time.Second)
 				}
-				json.NewEncoder(conn).Encode(rejeicao)
+
+				_ = enc.Encode(map[string]interface{}{"acao": "rejeitado"})
 				return
 			}
-
 			d.Status = "em_missao"
 			d.mu.Unlock()
 
-			// ACK imediato ao broker remetente do comando
-			ack := protocol.Mensagem{
+			_ = enc.Encode(protocol.Mensagem{
 				Tipo:      protocol.TipoACK,
 				IDOrigem:  d.ID,
 				Timestamp: time.Now(),
-			}
-			json.NewEncoder(conn).Encode(ack)
+			})
 
 			var comando protocol.ComandoMissao
-			json.Unmarshal([]byte(msg.Payload), &comando)
+			_ = json.Unmarshal([]byte(msg.Payload), &comando)
 
-			fmt.Printf("[Drone %s] ✈  Missão aceita: %s (P%d)\n",
-				d.ID, comando.OcorrenciaID, comando.Prioridade)
-
+			fmt.Printf("[Drone %s] ✈  Missão aceita: %s (P%d)\n", d.ID, comando.OcorrenciaID, comando.Prioridade)
 			go d.executarMissao(comando)
+			return
 
 		case protocol.TipoRegistroDrone:
-			d.registrarNosBrokers()
+			go d.registrarNosBrokers()
 		}
 	}
 }
-
-// ============================================================
-// SIMULAÇÃO DE MISSÃO
-// ============================================================
 
 func (d *Drone) executarMissao(comando protocol.ComandoMissao) {
 	base := map[int]int{1: 5, 2: 8, 3: 12}[comando.Prioridade]
@@ -238,28 +207,21 @@ func (d *Drone) executarMissao(comando protocol.ComandoMissao) {
 		Timestamp: time.Now(),
 	}
 
+	d.mu.Lock()
 	if batAtual < 20 {
-		fmt.Printf("[Drone %s] ⚡ Bateria baixa. Iniciando recarga...\n", d.ID)
-		d.mu.Lock()
 		d.Status = "recarregando"
 		d.mu.Unlock()
-		go d.recarregar() // Usa goroutine para não atrasar o envio do laudo
+		d.reportarLaudo(laudo)
+		go d.recarregar()
 	} else {
-		d.mu.Lock()
-		d.Status = "disponivel" // <-- CRÍTICO: Define como livre ANTES do broadcast
+		d.Status = "disponivel"
 		d.mu.Unlock()
+		d.reportarLaudo(laudo)
 	}
-
-	// Avisa os Brokers (eles já encontrarão o drone livre se vierem rápido)
-	d.reportarLaudo(laudo)
 }
 
 func (d *Drone) recarregar() {
 	fmt.Printf("[Drone %s] ⚡ Bateria baixa. Recarregando (60s)...\n", d.ID)
-	d.mu.Lock()
-	d.Status = "recarregando"
-	d.mu.Unlock()
-
 	time.Sleep(60 * time.Second)
 
 	d.mu.Lock()
@@ -269,15 +231,18 @@ func (d *Drone) recarregar() {
 
 	fmt.Printf("[Drone %s] ✅ Recarga completa.\n", d.ID)
 	d.registrarNosBrokers()
+
+	// HACK: Envia um laudo fantasma para forçar os Brokers a enxergarem o drone como livre novamente
+	d.reportarLaudo(protocol.Laudo{
+		MissaoID:  "RECARGA",
+		DroneID:   d.ID,
+		Resultado: "Bateria recarregada com sucesso",
+		Timestamp: time.Now(),
+	})
 }
 
-// ============================================================
-// COMUNICAÇÃO TOTALMENTE DESCENTRALIZADA (BROADCAST)
-// ============================================================
-
-// registrarNosBrokers envia o handshake de identificação a todos os brokers conhecidos.
 func (d *Drone) registrarNosBrokers() {
-	info := protocol.InfoConexao{Tipo: "drone", ID: d.ID}
+	info := protocol.InfoConexao{Tipo: "drone", ID: d.ID, Endereco: d.Endereco}
 	payload, _ := json.Marshal(info)
 	msg := protocol.Mensagem{
 		Tipo:      protocol.TipoHandshake,
@@ -285,11 +250,10 @@ func (d *Drone) registrarNosBrokers() {
 		Timestamp: time.Now(),
 		Payload:   string(payload),
 	}
-	
+
 	d.enviarParaTodosBrokers(msg, "Registro")
 }
 
-// reportarLaudo distribui o laudo estruturado por todo o cluster de brokers.
 func (d *Drone) reportarLaudo(laudo protocol.Laudo) {
 	payload, _ := json.Marshal(laudo)
 	msg := protocol.Mensagem{
@@ -298,12 +262,10 @@ func (d *Drone) reportarLaudo(laudo protocol.Laudo) {
 		Timestamp: time.Now(),
 		Payload:   string(payload),
 	}
-	
+
 	d.enviarParaTodosBrokers(msg, "Laudo de Missão")
 }
 
-// enviarParaTodosBrokers realiza o disparo em broadcast. 
-// Substitui a antiga lógica de fallback e expõe quedas locais de rede/nós.
 func (d *Drone) enviarParaTodosBrokers(msg protocol.Mensagem, contexto string) {
 	d.mu.Lock()
 	listaBrokers := make([]string, len(d.Brokers))
@@ -316,10 +278,7 @@ func (d *Drone) enviarParaTodosBrokers(msg protocol.Mensagem, contexto string) {
 		go func(target string) {
 			defer wg.Done()
 			if d.tentarEnvio(target, msg) {
-				fmt.Printf("[Drone %s] [%s] Enviado com sucesso para o broker: %s\n", d.ID, contexto, target)
-			} else {
-				// Captura da queda de rede ou indisponibilidade do dispositivo broker em tempo de execução
-				fmt.Printf("[Drone %s] [%s] FALHA de conexão com o broker: %s (Alerta de desconexão/rede)\n", d.ID, contexto, target)
+				//fmt.Printf("[Drone %s] [%s] Enviado com sucesso para o broker: %s\n", d.ID, contexto, target)
 			}
 		}(addr)
 	}
@@ -330,7 +289,6 @@ func (d *Drone) tentarEnvio(addr string, msg protocol.Mensagem) bool {
 	cfg := &tls.Config{InsecureSkipVerify: true}
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr, cfg)
 	if err != nil {
-		// Fallback TCP puro caso o TLS falhe
 		conn2, err2 := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err2 != nil {
 			return false
@@ -342,21 +300,16 @@ func (d *Drone) tentarEnvio(addr string, msg protocol.Mensagem) bool {
 	return json.NewEncoder(conn).Encode(msg) == nil
 }
 
-// ============================================================
-// CONFIGURAÇÃO
-// ============================================================
-
 func carregarBrokers(caminho string) ([]string, error) {
 	arquivo, err := os.ReadFile(caminho)
 	if err != nil {
 		return nil, err
 	}
 	mapa := make(map[string]string)
-	json.Unmarshal(arquivo, &mapa)
+	_ = json.Unmarshal(arquivo, &mapa)
 
 	ids := make([]int, 0)
 	for k := range mapa {
-		// Suporta tanto "1" quanto "broker1" como chaves
 		n := 0
 		fmt.Sscanf(k, "broker%d", &n)
 		if n == 0 {

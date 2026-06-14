@@ -571,16 +571,64 @@ func (b *Broker) handleRARequest(msg protocol.Mensagem) {
 	idReq, err2 := strconv.Atoi(req.BrokerID)
 
 	var deveAdiar bool
-	if err1 == nil && err2 == nil {
-		deveAdiar = b.inCS || (b.requesting && (meuRelogio < req.Relogio || (meuRelogio == req.Relogio && idLocal < idReq)))
+	if b.inCS {
+		deveAdiar = true
+	} else if b.requesting {
+		minhaPrio := b.currentReqRA.Prioridade
+		reqPrio := req.Prioridade
+
+		// REGRA 1: Desempate por Prioridade (Maior valor = Maior Urgência)
+		if minhaPrio > reqPrio {
+			deveAdiar = true // Minha urgência é maior, eu adio o pedido dele
+		} else if reqPrio > minhaPrio {
+			deveAdiar = false // Urgência dele é maior, eu cedo a vez
+		} else {
+			// REGRA 2: Empate de prioridade, resolve pelo Relógio de Lamport (Menor = Mais Antigo)
+			if meuRelogio < req.Relogio {
+				deveAdiar = true
+			} else if meuRelogio > req.Relogio {
+				deveAdiar = false
+			} else {
+				// REGRA 3: Empate de relógio, resolve pelo ID (menor ID ganha)
+				if err1 == nil && err2 == nil {
+					deveAdiar = idLocal < idReq
+				} else {
+					deveAdiar = b.id < req.BrokerID
+				}
+			}
+		}
 	} else {
-		deveAdiar = b.inCS || (b.requesting && (meuRelogio < req.Relogio || (meuRelogio == req.Relogio && b.id < req.BrokerID)))
+		deveAdiar = false
 	}
 
 	if deveAdiar {
 		b.deferred[req.BrokerID] = true
 		b.mu.Unlock()
 		return
+	}
+
+	// ============================================================
+	// CEDENDO A VEZ: RENOVAÇÃO DE CRÉDITOS E AGING DA FILA
+	// ============================================================
+	if b.requesting {
+		// 1. Renovação: propõe transação de 5 créditos do "sistema" para a companhia
+		if b.currentReqOc != nil && b.currentReqOc.Solicitante != "" {
+			txReward := protocol.Transacao{
+				ID:           fmt.Sprintf("RENOVA-%s-%d", b.currentReqOc.ID, time.Now().UnixNano()),
+				De:           "sistema",
+				Para:         b.currentReqOc.Solicitante,
+				Creditos:     5, 
+				OcorrenciaID: b.currentReqOc.ID,
+				Timestamp:    time.Now(),
+			}
+			go b.proporBloco(blockchain.TipoBloco_Transacao, txReward)
+		}
+
+		// 2. Aging: envelhece a prioridade das ocorrências da fila local
+		qtdEnvelhecida := b.fila.AplicarAging()
+		if qtdEnvelhecida > 0 {
+			fmt.Printf("[Broker %s] [AGING] %d ocorrências na fila subiram de prioridade ao ceder a vez.\n", b.id, qtdEnvelhecida)
+		}
 	}
 
 	delete(b.deferred, req.BrokerID)
@@ -958,8 +1006,17 @@ func (b *Broker) commitarBloco(bloco blockchain.Bloco) {
 	if bloco.TipoDados == blockchain.TipoBloco_Transacao {
 		var tx protocol.Transacao
 		if err := json.Unmarshal([]byte(bloco.Dados), &tx); err == nil {
-			fmt.Printf("[Broker %s] Créditos debitados da companhia: %s\n", b.id, tx.De)
-			b.chain.DebitarCreditos(tx.De, tx.Creditos)
+			
+			// Débitos (Pagamento padrão de missão)
+			if tx.De != "sistema" && tx.De != "" {
+				fmt.Printf("[Broker %s] Créditos debitados da companhia: %s\n", b.id, tx.De)
+				b.chain.DebitarCreditos(tx.De, tx.Creditos)
+			}
+			
+			// Créditos (Recompensas de Ricart-Agrawala)
+			if tx.Para != "sistema" && tx.Para != "" {
+				b.chain.CreditarSaldo(tx.Para, tx.Creditos)
+			}
 		}
 	}
 }

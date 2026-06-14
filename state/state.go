@@ -101,6 +101,20 @@ func (f *FilaComAging) Pop() *protocol.Ocorrencia {
 	return item
 }
 
+// AplicarAging incrementa a prioridade de todos os itens na fila
+// e reorganiza a heap em O(n), prevenindo o starvation de tarefas antigas.
+func (f *FilaComAging) AplicarAging() int {
+    if f.fila.Len() == 0 {
+        return 0
+    }
+    for _, oc := range f.fila {
+        oc.Prioridade++
+    }
+    // Reordena o heap nativamente após alterar as prioridades em massa
+    heap.Init(&f.fila)
+    return len(f.fila)
+}
+
 // Len retorna o número de itens na fila.
 func (f *FilaComAging) Len() int {
 	return f.fila.Len()

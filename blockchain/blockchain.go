@@ -375,10 +375,16 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 		if bloco.TipoDados == TipoBloco_Transacao {
 			var tx struct {
 				De       string `json:"de"`
+				Para     string `json:"para"` // <--- Reconhecendo o campo
 				Creditos int    `json:"creditos"`
 			}
 			if err := json.Unmarshal([]byte(bloco.Dados), &tx); err == nil {
-				c.Saldos[tx.De] -= tx.Creditos
+				if tx.De != "sistema" && tx.De != "" {
+					c.Saldos[tx.De] -= tx.Creditos
+				}
+				if tx.Para != "sistema" && tx.Para != "" {
+					c.Saldos[tx.Para] += tx.Creditos // <--- Recriando a recompensa
+				}
 			}
 		}
 	}

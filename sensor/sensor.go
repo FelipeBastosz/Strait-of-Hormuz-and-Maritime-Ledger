@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"os"
 	"time"
 
@@ -55,6 +56,19 @@ func main() {
 	setorID := os.Args[2]
 	enderecoBroker := os.Args[3]
 
+	// ============================================================
+	// NOVA LÓGICA: Geração dinâmica do prefixo (ex: broker1 -> b1)
+	// ============================================================
+	host := strings.Split(enderecoBroker, ":")[0]            // Pega "broker1"
+	numBroker := strings.Replace(host, "broker", "", 1)      // Pega "1"
+	prefixoBroker := "b" + numBroker + "-"                   // Forma "b1-"
+
+	// Mapeia o array base para o escopo deste broker
+	companhiasDoBroker := make([]string, len(companhias))
+	for i, c := range companhias {
+		companhiasDoBroker[i] = prefixoBroker + c
+	}
+
 	intervaloMin := 15
 	if v := os.Getenv("SENSOR_INTERVALO_MIN"); v != "" {
 		fmt.Sscan(v, &intervaloMin)
@@ -64,9 +78,10 @@ func main() {
 		fmt.Sscan(v, &intervaloMax)
 	}
 
-	fmt.Printf("[Sensor %s | Setor %s] Iniciado → broker %s | intervalo %d–%ds\n",
+	fmt.Printf("[Sensor %s | Setor %s] Iniciado → broker %s | intervalo %d–%ds\n", 
 		sensorID, setorID, enderecoBroker, intervaloMin, intervaloMax)
-
+    
+	fmt.Printf("[Sensor %s] Companhias associadas: %v\n", sensorID, companhiasDoBroker)
 	rand.Seed(time.Now().UnixNano())
 	contador := 0
 
@@ -77,7 +92,7 @@ func main() {
 		contador++
 		prioridade := gerarPrioridade()
 		descricao := tiposOcorrencia[rand.Intn(len(tiposOcorrencia))]
-		solicitante := companhias[rand.Intn(len(companhias))]
+		solicitante := companhiasDoBroker[rand.Intn(len(companhiasDoBroker))]
 
 		ocorrencia := protocol.Ocorrencia{
 			ID:          fmt.Sprintf("%s-OC%04d", sensorID, contador),

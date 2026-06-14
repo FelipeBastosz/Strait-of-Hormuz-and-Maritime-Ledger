@@ -74,6 +74,7 @@ type Broker struct {
 	relogioLocal int64
 	requesting   bool
 	inCS         bool
+	currentReqOc *protocol.Ocorrencia
 	currentReqID string
 	currentReqRA protocol.RequisicaoRA
 	respostasOK  map[string]bool
@@ -92,11 +93,18 @@ type Broker struct {
 }
 
 func novoBroker(id string, mapaRede map[string]string) *Broker {
-	saldosIniciais := map[string]int{
-		"companhia-a": creditosIniciais,
-		"companhia-b": creditosIniciais,
-		"companhia-c": creditosIniciais,
-		"companhia-d": creditosIniciais,
+	saldosIniciais := make(map[string]int)
+
+	// Preenche o ledger com as companhias de TODOS os brokers do cluster
+	for brokerNome := range mapaRede {
+		// Extrai o número do broker (ex: "broker1" vira "1", "broker2" vira "2")
+		num := strings.Replace(brokerNome, "broker", "", 1)
+		prefixo := "b" + num + "-"
+
+		saldosIniciais[prefixo+"companhia-a"] = creditosIniciais
+		saldosIniciais[prefixo+"companhia-b"] = creditosIniciais
+		saldosIniciais[prefixo+"companhia-c"] = creditosIniciais
+		saldosIniciais[prefixo+"companhia-d"] = creditosIniciais
 	}
 
 	b := &Broker{
@@ -189,13 +197,13 @@ func (b *Broker) conectarPeers() {
 		if peerID == b.id {
 			continue
 		}
-		go b.mantenerConexaoPeer(peerID, peerAddr)
+		go b.manterConexaoPeer(peerID, peerAddr)
 	}
 	time.Sleep(2 * time.Second)
 	b.solicitarChain()
 }
 
-func (b *Broker) mantenerConexaoPeer(peerID, peerAddr string) {
+func (b *Broker) manterConexaoPeer(peerID, peerAddr string) {
 	cfg := &tls.Config{InsecureSkipVerify: true}
 	for {
 		b.mu.Lock()
@@ -457,6 +465,10 @@ func (b *Broker) handleStatusDrone(msg protocol.Mensagem) {
 	fmt.Printf("[Broker %s] ✅ Missão %s concluída | drone=%s | resultado: %s\n",
 		b.id, laudo.MissaoID, laudo.DroneID, laudo.Resultado)
 
+	fmt.Printf("[Broker %s] Saldo atual das minhas companhias: companhia-a=%d companhia-b=%d companhia-c=%d companhia-d=%d\n", b.id,
+		b.chain.ConsultarSaldo(fmt.Sprintf("b%s-companhia-a", b.id)), b.chain.ConsultarSaldo(fmt.Sprintf("b%s-companhia-b", b.id)), 
+		b.chain.ConsultarSaldo(fmt.Sprintf("b%s-companhia-c", b.id)), b.chain.ConsultarSaldo(fmt.Sprintf("b%s-companhia-d", b.id)))
+
 	for _, peerID := range adiados {
 		b.enviarRAOK(peerID)
 	}
@@ -506,6 +518,7 @@ func (b *Broker) tentarDespachar() {
 	b.relogioLocal++
 	b.requesting = true
 	b.currentReqID = oc.ID
+	b.currentReqOc = oc
 	b.currentReqRA = protocol.RequisicaoRA{
 		BrokerID:   b.id,
 		Relogio:    b.relogioLocal,
@@ -597,12 +610,11 @@ func (b *Broker) handleRAOK(msg protocol.Mensagem) {
 		}
 	}
 
-	ocID := b.currentReqID
-	oc := &protocol.Ocorrencia{
-		ID:         ocID,
-		Prioridade: b.currentReqRA.Prioridade,
-		Timestamp:  b.currentReqRA.Timestamp,
-	}
+	oc := b.currentReqOc
+
+	fmt.Printf("[Broker %s] [RA] OK de %s (%d/%d)\n",
+		b.id, msg.IDOrigem, recebidos, necessario)
+
 
 	// --- CORREÇÃO: Voltar ao >= e travar o state imediatamente ---
 	if recebidos >= necessario {
@@ -628,6 +640,7 @@ func (b *Broker) entrarCS(oc *protocol.Ocorrencia) {
 	b.mu.Lock()
 	b.inCS = false
 	// --- CORREÇÃO: Limpar os dados estaduais do RA para a próxima requisição ---
+	b.currentReqOc = nil
 	b.currentReqID = ""
 	b.respostasOK = make(map[string]bool)
 
@@ -808,6 +821,29 @@ func (b *Broker) recolocarOcorrenciaNaFila(oc *protocol.Ocorrencia, droneID stri
 // ============================================================
 
 func (b *Broker) proporBloco(tipoDados blockchain.TipoDados, dados interface{}) {
+	// --- CORREÇÃO: Fila de Consenso com Escape Hatch (Timeout) ---
+	inicioEspera := time.Now()
+	for {
+		b.mu.Lock()
+		emConsenso := len(b.blocosPendentes) > 0
+		b.mu.Unlock()
+		
+		if !emConsenso {
+			break
+		}
+		
+		// Se a rede travar por mais de 3 segundos, limpamos o gargalo para não congelar o sistema
+		if time.Since(inicioEspera) > 3*time.Second {
+			b.mu.Lock()
+			b.blocosPendentes = make(map[string]blockchain.Bloco)
+			b.votosBloco = make(map[string]int)
+			b.mu.Unlock()
+			fmt.Printf("[Broker %s] [ALERTA] Timeout na rede. Limpando fila de consenso.\n", b.id)
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	bloco, err := b.chain.ProporBloco(tipoDados, dados, b.id)
 	if err != nil {
 		return
@@ -854,7 +890,10 @@ func (b *Broker) handleNovoBloco(msg protocol.Mensagem) {
 	b.mu.Lock()
 	if _, ok := b.blocosPendentes[bloco.Hash]; !ok {
 		b.blocosPendentes[bloco.Hash] = bloco
+		// --- CORREÇÃO: Adiciona o voto implícito de quem propôs o bloco ---
+		b.votosBloco[bloco.Hash] = 1 
 	}
+	// Adiciona o nosso próprio voto de aceite
 	b.votosBloco[bloco.Hash]++
 	votos := b.votosBloco[bloco.Hash]
 	total := len(b.connBrokers) + 1
@@ -919,6 +958,7 @@ func (b *Broker) commitarBloco(bloco blockchain.Bloco) {
 	if bloco.TipoDados == blockchain.TipoBloco_Transacao {
 		var tx protocol.Transacao
 		if err := json.Unmarshal([]byte(bloco.Dados), &tx); err == nil {
+			fmt.Printf("[Broker %s] Créditos debitados da companhia: %s\n", b.id, tx.De)
 			b.chain.DebitarCreditos(tx.De, tx.Creditos)
 		}
 	}
@@ -942,12 +982,20 @@ func (b *Broker) handleRespChain(msg protocol.Mensagem) {
 	if err := json.Unmarshal([]byte(msg.Payload), &blocos); err != nil {
 		return
 	}
-	saldosBase := map[string]int{
-		"companhia-a": creditosIniciais,
-		"companhia-b": creditosIniciais,
-		"companhia-c": creditosIniciais,
-		"companhia-d": creditosIniciais,
+	
+	saldosBase := make(map[string]int)
+	
+	// Recria os saldos base para todos os brokers conhecidos
+	for brokerNome := range b.mapaRede {
+		num := strings.Replace(brokerNome, "broker", "", 1)
+		prefixo := "b" + num + "-"
+
+		saldosBase[prefixo+"companhia-a"] = creditosIniciais
+		saldosBase[prefixo+"companhia-b"] = creditosIniciais
+		saldosBase[prefixo+"companhia-c"] = creditosIniciais
+		saldosBase[prefixo+"companhia-d"] = creditosIniciais
 	}
+
 	if b.chain.SubstituirChain(blocos, saldosBase) {
 		fmt.Printf("[Broker %s] [Chain] Sincronizada: %d blocos\n", b.id, b.chain.Tamanho())
 	}

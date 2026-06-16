@@ -92,20 +92,38 @@ type Broker struct {
 	blocosPendentes map[string]blockchain.Bloco
 }
 
-func novoBroker(id string, mapaRede map[string]string) *Broker {
-	saldosIniciais := make(map[string]int)
-
-	// Preenche o ledger com as companhias de TODOS os brokers do cluster
-	for brokerNome := range mapaRede {
-		// Extrai o número do broker (ex: "broker1" vira "1", "broker2" vira "2")
-		num := strings.Replace(brokerNome, "broker", "", 1)
-		prefixo := "b" + num + "-"
-
-		saldosIniciais[prefixo+"companhia-a"] = creditosIniciais
-		saldosIniciais[prefixo+"companhia-b"] = creditosIniciais
-		saldosIniciais[prefixo+"companhia-c"] = creditosIniciais
-		saldosIniciais[prefixo+"companhia-d"] = creditosIniciais
+func obterPaisesPorBroker(numBroker string) []string {
+	prefixo := "b" + numBroker + "-"
+	switch numBroker {
+	case "1":
+		return []string{prefixo + "alemanha", prefixo + "franca", prefixo + "italia", prefixo + "inglaterra"}
+	case "2":
+		return []string{prefixo + "china", prefixo + "japao", prefixo + "india", prefixo + "emirados"}
+	case "3":
+		return []string{prefixo + "eua", prefixo + "canada", prefixo + "brasil", prefixo + "argentina"}
+	case "4":
+		return []string{prefixo + "egito", prefixo + "somalia", prefixo + "djibuti", prefixo + "africadosul"}
+	case "5":
+		return []string{prefixo + "australia", prefixo + "novazelandia", prefixo + "indonesia", prefixo + "filipinas"}
+	default:
+		return []string{prefixo + "desconhecido"}
 	}
+}
+
+func gerarSaldosIniciais(mapaRede map[string]string) map[string]int {
+	saldos := make(map[string]int)
+	for brokerNome := range mapaRede {
+		num := strings.Replace(brokerNome, "broker", "", 1)
+		paises := obterPaisesPorBroker(num)
+		for _, pais := range paises {
+			saldos[pais] = creditosIniciais
+		}
+	}
+	return saldos
+}
+
+func novoBroker(id string, mapaRede map[string]string) *Broker {
+	saldosIniciais := gerarSaldosIniciais(mapaRede)
 
 	b := &Broker{
 		id:              id,
@@ -465,9 +483,14 @@ func (b *Broker) handleStatusDrone(msg protocol.Mensagem) {
 	fmt.Printf("[Broker %s] ✅ Missão %s concluída | drone=%s | resultado: %s\n",
 		b.id, laudo.MissaoID, laudo.DroneID, laudo.Resultado)
 
-	fmt.Printf("[Broker %s] Saldo atual das minhas companhias: companhia-a=%d companhia-b=%d companhia-c=%d companhia-d=%d\n", b.id,
-		b.chain.ConsultarSaldo(fmt.Sprintf("b%s-companhia-a", b.id)), b.chain.ConsultarSaldo(fmt.Sprintf("b%s-companhia-b", b.id)), 
-		b.chain.ConsultarSaldo(fmt.Sprintf("b%s-companhia-c", b.id)), b.chain.ConsultarSaldo(fmt.Sprintf("b%s-companhia-d", b.id)))
+	paises := obterPaisesPorBroker(b.id)
+	if len(paises) >= 4 {
+		fmt.Printf("[Broker %s] Saldo atual das minhas companhias: %s=%d %s=%d %s=%d %s=%d\n", b.id,
+			paises[0], b.chain.ConsultarSaldo(paises[0]),
+			paises[1], b.chain.ConsultarSaldo(paises[1]),
+			paises[2], b.chain.ConsultarSaldo(paises[2]),
+			paises[3], b.chain.ConsultarSaldo(paises[3]))
+	}
 
 	for _, peerID := range adiados {
 		b.enviarRAOK(peerID)
@@ -1040,18 +1063,8 @@ func (b *Broker) handleRespChain(msg protocol.Mensagem) {
 		return
 	}
 	
-	saldosBase := make(map[string]int)
-	
-	// Recria os saldos base para todos os brokers conhecidos
-	for brokerNome := range b.mapaRede {
-		num := strings.Replace(brokerNome, "broker", "", 1)
-		prefixo := "b" + num + "-"
-
-		saldosBase[prefixo+"companhia-a"] = creditosIniciais
-		saldosBase[prefixo+"companhia-b"] = creditosIniciais
-		saldosBase[prefixo+"companhia-c"] = creditosIniciais
-		saldosBase[prefixo+"companhia-d"] = creditosIniciais
-	}
+	// Gera a base de dados dinamicamente usando os países configurados
+	saldosBase := gerarSaldosIniciais(b.mapaRede)
 
 	if b.chain.SubstituirChain(blocos, saldosBase) {
 		fmt.Printf("[Broker %s] [Chain] Sincronizada: %d blocos\n", b.id, b.chain.Tamanho())

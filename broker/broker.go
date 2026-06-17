@@ -1,9 +1,5 @@
 // ============================================================
 // BROKER — Nó do cluster totalmente descentralizado
-//
-// Arquitetura P2P pura — sem coordenador, sem líder, sem eleição.
-// Cada broker é igual aos demais. Todo o controle de concorrência
-// sobre os drones é feito exclusivamente pelo Ricart-Agrawala.
 // ============================================================
 
 package main
@@ -58,7 +54,6 @@ func (c *connSegura) fechar() {
 }
 
 const (
-	intervaloGossip    = 2 * time.Second
 	intervaloHeartbeat = 5 * time.Second
 	timeoutHeartbeat   = 12 * time.Second
 	creditosIniciais   = 100
@@ -95,10 +90,11 @@ type Broker struct {
 	connClientes map[net.Conn]string
 	ultimoHB     map[string]time.Time
 
-	// Blockchain
+	// Blockchain e Segurança
 	chain           *blockchain.Chain
 	votosBloco      map[string]int
 	blocosPendentes map[string]blockchain.Bloco
+	esperandoSync   bool // 🛡️ TRAVA ANTI-INJEÇÃO DE HISTÓRICO FALSO
 }
 
 func obterPaisesPorBroker(numBroker string) []string {
@@ -135,25 +131,27 @@ func novoBroker(id string, mapaRede map[string]string) *Broker {
 	saldosIniciais := gerarSaldosIniciais(mapaRede)
 
 	b := &Broker{
-		id:              id,
-		endereco:        mapaRede[id],
-		mapaRede:        mapaRede,
-		drones:          make(map[string]*protocol.Drone),
-		missoesAtivas:   make(map[string]bool),
+		id:               id,
+		endereco:         mapaRede[id],
+		mapaRede:         mapaRede,
+		drones:           make(map[string]*protocol.Drone),
+		missoesAtivas:    make(map[string]bool),
 		missoesPendentes: make(map[string]InfoDespacho),
-		respostasOK:     make(map[string]bool),
-		deferred:        make(map[string]bool),
-		connBrokers:     make(map[string]*connSegura),
-		connDrones:      make(map[net.Conn]string),
-		connClientes:    make(map[net.Conn]string),
-		ultimoHB:        make(map[string]time.Time),
-		votosBloco:      make(map[string]int),
-		blocosPendentes: make(map[string]blockchain.Bloco),
-		chain:           blockchain.NovaChain(id, saldosIniciais),
+		respostasOK:      make(map[string]bool),
+		deferred:         make(map[string]bool),
+		connBrokers:      make(map[string]*connSegura),
+		connDrones:       make(map[net.Conn]string),
+		connClientes:     make(map[net.Conn]string),
+		ultimoHB:         make(map[string]time.Time),
+		votosBloco:       make(map[string]int),
+		blocosPendentes:  make(map[string]blockchain.Bloco),
+		chain:            blockchain.NovaChain(id, saldosIniciais),
+		esperandoSync:    false,
 	}
 	b.fila.Inicializar()
 
 	fmt.Printf("[Broker %s] Iniciado em %s | %d nós no cluster\n", id, mapaRede[id], len(mapaRede))
+	go b.recargaAutomaticaLoop()
 	return b
 }
 
@@ -228,6 +226,10 @@ func (b *Broker) conectarPeers() {
 		go b.manterConexaoPeer(peerID, peerAddr)
 	}
 	time.Sleep(2 * time.Second)
+	
+	b.mu.Lock()
+	b.esperandoSync = true
+	b.mu.Unlock()
 	b.solicitarChain()
 }
 
@@ -298,8 +300,6 @@ func (b *Broker) handleConexao(conn net.Conn) {
 		switch info.Tipo {
 		case "broker":
 			b.mu.Lock()
-			// --- CORREÇÃO: Desambiguação de conexões simultâneas ---
-			// Se já existe uma conexão ativa e meu ID é menor que o dele, recuso a duplicada
 			if _, existe := b.connBrokers[info.ID]; existe && b.id < info.ID {
 				b.mu.Unlock()
 				conn.Close()
@@ -326,8 +326,6 @@ func (b *Broker) handleConexao(conn net.Conn) {
 				if info.Endereco != "" {
 					d.Posicao = info.Endereco
 				}
-				// Força o status para disponivel independente de estar como "recarregando" ou "indisponivel"
-				// Isso garante que o Broker limpe o estado local assim que o drone se reconectar ativo
 				if d.Status != "disponivel" {
 					d.Status = "disponivel"
 					fmt.Printf("[Broker %s] Drone %s está pronto e disponível novamente\n", b.id, info.ID)
@@ -336,8 +334,6 @@ func (b *Broker) handleConexao(conn net.Conn) {
 			b.mu.Unlock()
 
 			fmt.Printf("[Broker %s] Drone %s registrado (addr=%s)\n", b.id, info.ID, info.Endereco)
-
-			// Notifica o cluster/fila local que há um novo recurso livre para trabalhar
 			go b.tentarDespachar()
 			b.lerMensagens(cs, info.ID, dec)
 
@@ -379,11 +375,7 @@ func (b *Broker) despachar(cs *connSegura, msg protocol.Mensagem) {
 		b.mu.Lock()
 		b.ultimoHB[msg.IDOrigem] = time.Now()
 		b.mu.Unlock()
-		_ = cs.enviar(protocol.Mensagem{
-			Tipo:      protocol.TipoPong,
-			IDOrigem:  b.id,
-			Timestamp: time.Now(),
-		})
+		_ = cs.enviar(protocol.Mensagem{Tipo: protocol.TipoPong, IDOrigem: b.id, Timestamp: time.Now()})
 
 	case protocol.TipoPong:
 		b.mu.Lock()
@@ -438,9 +430,19 @@ func (b *Broker) handleOcorrencia(cs *connSegura, msg protocol.Mensagem) {
 		oc.Creditos = custoEscolta
 	}
 
-	if oc.Solicitante != "" {
+	b.mu.Lock()
+	totalAtivos := 0
+	for id := range b.connBrokers {
+		if !strings.HasPrefix(id, "tester") {
+			totalAtivos++
+		}
+	}
+	b.mu.Unlock()
+
+	// 🛡️ Validação Pré-Fila (Apenas se a rede não estiver em Modo Solo)
+	if oc.Solicitante != "" && totalAtivos > 0 {
 		if err := b.chain.ValidarTransacao(oc.Solicitante, oc.Creditos); err != nil {
-			fmt.Printf("[Broker %s] Créditos insuficientes: %v\n", b.id, err)
+			fmt.Printf("[Broker %s] Créditos insuficientes para %s: %v\n", b.id, oc.Solicitante, err)
 			_ = cs.enviar(protocol.Mensagem{
 				Tipo:      "NACK",
 				IDOrigem:  b.id,
@@ -460,8 +462,7 @@ func (b *Broker) handleOcorrencia(cs *connSegura, msg protocol.Mensagem) {
 		IDOrigem:  b.id,
 		Timestamp: time.Now(),
 	})
-	fmt.Printf("[Broker %s] Ocorrência %s enfileirada (P%d) | fila local: %d\n",
-		b.id, oc.ID, oc.Prioridade, b.fila.Len())
+	fmt.Printf("[Broker %s] Ocorrência %s enfileirada (P%d) | fila local: %d\n", b.id, oc.ID, oc.Prioridade, b.fila.Len())
 
 	go b.tentarDespachar()
 }
@@ -490,12 +491,11 @@ func (b *Broker) handleStatusDrone(msg protocol.Mensagem) {
 	}
 	b.mu.Unlock()
 
-	fmt.Printf("[Broker %s] ✅ Missão %s concluída | drone=%s | resultado: %s\n",
-		b.id, laudo.MissaoID, laudo.DroneID, laudo.Resultado)
+	fmt.Printf("[Broker %s] ✅ Missão %s concluída | drone=%s | resultado: %s\n", b.id, laudo.MissaoID, laudo.DroneID, laudo.Resultado)
 
-	paises := obterPaisesPorBroker(b.id)
+	paises := obterPaisesPorBroker(strings.Replace(b.id, "broker", "", 1))
 	if len(paises) >= 4 {
-		fmt.Printf("[Broker %s] Saldo atual das minhas companhias: %s=%d %s=%d %s=%d %s=%d\n", b.id,
+		fmt.Printf("[Broker %s] Saldo atual local: %s=%d %s=%d %s=%d %s=%d\n", b.id,
 			paises[0], b.chain.ConsultarSaldo(paises[0]),
 			paises[1], b.chain.ConsultarSaldo(paises[1]),
 			paises[2], b.chain.ConsultarSaldo(paises[2]),
@@ -507,7 +507,6 @@ func (b *Broker) handleStatusDrone(msg protocol.Mensagem) {
 	}
 
 	if eraMinhaMissao {
-		// Pequeno "Jitter" de tempo para evitar que missões terminando exatamento no mesmo ms causem fork na blockchain
 		go func() {
 			time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
 			b.proporBloco(blockchain.TipoBloco_Laudo, laudo)
@@ -525,19 +524,13 @@ func (b *Broker) tentarDespachar() {
 		return
 	}
 
-	// Usando dronesLivres() atualizado para não dar deadlock
 	livres := 0
 	for _, d := range b.drones {
 		if d.Status == "disponivel" {
 			livres++
 		}
 	}
-	if livres == 0 {
-		b.mu.Unlock()
-		return
-	}
-
-	if b.requesting || b.inCS {
+	if livres == 0 || b.requesting || b.inCS {
 		b.mu.Unlock()
 		return
 	}
@@ -570,8 +563,10 @@ func (b *Broker) tentarDespachar() {
 	}
 	b.mu.Unlock()
 
-	fmt.Printf("[Broker %s] [RA] REQUEST ocorrência=%s prioridade=%d relógio=%d\n",
-		b.id, oc.ID, oc.Prioridade, b.currentReqRA.Relogio)
+	if len(peers) == 0 {
+		b.entrarCS(oc)
+		return
+	}
 
 	payload, _ := json.Marshal(b.currentReqRA)
 	reqMsg := protocol.Mensagem{
@@ -583,10 +578,6 @@ func (b *Broker) tentarDespachar() {
 
 	for _, c := range peers {
 		_ = c.enviar(reqMsg)
-	}
-
-	if len(peers) == 0 {
-		b.entrarCS(oc)
 	}
 }
 
@@ -610,19 +601,16 @@ func (b *Broker) handleRARequest(msg protocol.Mensagem) {
 		minhaPrio := b.currentReqRA.Prioridade
 		reqPrio := req.Prioridade
 
-		// REGRA 1: Desempate por Prioridade (Maior valor = Maior Urgência)
 		if minhaPrio > reqPrio {
-			deveAdiar = true // Minha urgência é maior, eu adio o pedido dele
+			deveAdiar = true
 		} else if reqPrio > minhaPrio {
-			deveAdiar = false // Urgência dele é maior, eu cedo a vez
+			deveAdiar = false
 		} else {
-			// REGRA 2: Empate de prioridade, resolve pelo Relógio de Lamport (Menor = Mais Antigo)
 			if meuRelogio < req.Relogio {
 				deveAdiar = true
 			} else if meuRelogio > req.Relogio {
 				deveAdiar = false
 			} else {
-				// REGRA 3: Empate de relógio, resolve pelo ID (menor ID ganha)
 				if err1 == nil && err2 == nil {
 					deveAdiar = idLocal < idReq
 				} else {
@@ -640,28 +628,19 @@ func (b *Broker) handleRARequest(msg protocol.Mensagem) {
 		return
 	}
 
-	// ============================================================
-	// CEDENDO A VEZ: RENOVAÇÃO DE CRÉDITOS E AGING DA FILA
-	// ============================================================
 	if b.requesting {
-		// 1. Renovação: propõe transação de 5 créditos do "sistema" para a companhia
 		if b.currentReqOc != nil && b.currentReqOc.Solicitante != "" {
 			txReward := protocol.Transacao{
 				ID:           fmt.Sprintf("RENOVA-%s-%d", b.currentReqOc.ID, time.Now().UnixNano()),
 				De:           "sistema",
 				Para:         b.currentReqOc.Solicitante,
-				Creditos:     5, 
+				Creditos:     5,
 				OcorrenciaID: b.currentReqOc.ID,
 				Timestamp:    time.Now(),
 			}
 			go b.proporBloco(blockchain.TipoBloco_Transacao, txReward)
 		}
-
-		// 2. Aging: envelhece a prioridade das ocorrências da fila local
-		qtdEnvelhecida := b.fila.AplicarAging()
-		if qtdEnvelhecida > 0 {
-			fmt.Printf("[Broker %s] [AGING] %d ocorrências na fila subiram de prioridade ao ceder a vez.\n", b.id, qtdEnvelhecida)
-		}
+		b.fila.AplicarAging()
 	}
 
 	delete(b.deferred, req.BrokerID)
@@ -675,7 +654,6 @@ func (b *Broker) handleRAOK(msg protocol.Mensagem) {
 	}
 
 	b.mu.Lock()
-	// --- CORREÇÃO: Ignorar mensagens perdidas/atrasadas se não estivermos esperando ---
 	if !b.requesting || b.inCS {
 		b.mu.Unlock()
 		return
@@ -692,19 +670,12 @@ func (b *Broker) handleRAOK(msg protocol.Mensagem) {
 	}
 
 	oc := b.currentReqOc
-
-	fmt.Printf("[Broker %s] [RA] OK de %s (%d/%d)\n",
-		b.id, msg.IDOrigem, recebidos, necessario)
-
-
-	// --- CORREÇÃO: Voltar ao >= e travar o state imediatamente ---
 	if recebidos >= necessario {
-		b.requesting = false // Trava pra evitar Double-CS em caso de mensagens duplicadas
+		b.requesting = false
 		b.mu.Unlock()
 		b.entrarCS(oc)
 		return
 	}
-
 	b.mu.Unlock()
 }
 
@@ -714,13 +685,10 @@ func (b *Broker) entrarCS(oc *protocol.Ocorrencia) {
 	b.requesting = false
 	b.mu.Unlock()
 
-	fmt.Printf("[Broker %s] [RA] → CS | ocorrência=%s\n", b.id, oc.ID)
-
 	b.despacharDrone(oc)
 
 	b.mu.Lock()
 	b.inCS = false
-	// --- CORREÇÃO: Limpar os dados estaduais do RA para a próxima requisição ---
 	b.currentReqOc = nil
 	b.currentReqID = ""
 	b.respostasOK = make(map[string]bool)
@@ -736,7 +704,6 @@ func (b *Broker) entrarCS(oc *protocol.Ocorrencia) {
 		b.enviarRAOK(peerID)
 	}
 
-	// Dá um trigger para o caso de haver ocorrências pendentes na fila
 	go b.tentarDespachar()
 }
 
@@ -744,15 +711,14 @@ func (b *Broker) enviarRAOK(peerID string) {
 	b.mu.Lock()
 	cs, ok := b.connBrokers[peerID]
 	b.mu.Unlock()
-	if !ok {
-		return
+	if ok {
+		_ = cs.enviar(protocol.Mensagem{Tipo: protocol.TipoRAOK, IDOrigem: b.id, Timestamp: time.Now()})
 	}
-	_ = cs.enviar(protocol.Mensagem{
-		Tipo:      protocol.TipoRAOK,
-		IDOrigem:  b.id,
-		Timestamp: time.Now(),
-	})
 }
+
+// ============================================================
+// LÓGICA DE DESPACHO E MEMPOOL DE MISSÕES
+// ============================================================
 
 func (b *Broker) enviarComandoFisicoDrone(droneID string, droneAddr string, oc *protocol.Ocorrencia, msg protocol.Mensagem) {
 	var conn net.Conn
@@ -786,7 +752,7 @@ func (b *Broker) enviarComandoFisicoDrone(droneID string, droneAddr string, oc *
 			return
 		}
 
-		fmt.Printf("[Broker %s] ✈  Drone %s → ocorrência %s (P%d)\n", b.id, droneID, oc.ID, oc.Prioridade)
+		fmt.Printf("[Broker %s] ✈  Drone %s DECOLOU → ocorrência %s (P%d)\n", b.id, droneID, oc.ID, oc.Prioridade)
 	} else {
 		fmt.Printf("[Broker %s] Falha de rede com drone %s (%s). Devolvendo à fila.\n", b.id, droneID, droneAddr)
 		b.recolocarOcorrenciaNaFila(oc, droneID, false)
@@ -808,7 +774,6 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 		oc.Prioridade = 3
 		b.fila.Push(oc)
 		b.mu.Unlock()
-		fmt.Printf("[Broker %s] Nenhum drone local disponível. %s voltou à fila.\n", b.id, oc.ID)
 		return
 	}
 
@@ -820,13 +785,7 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 	b.missoesAtivas[oc.ID] = true
 	droneAddr := d.Posicao
 
-	reservaMsg := protocol.Mensagem{
-		Tipo:      protocol.TipoReservaDrone,
-		IDOrigem:  b.id,
-		Timestamp: time.Now(),
-		Payload:   droneID,
-	}
-
+	reservaMsg := protocol.Mensagem{Tipo: protocol.TipoReservaDrone, IDOrigem: b.id, Timestamp: time.Now(), Payload: droneID}
 	peers := make([]*connSegura, 0, len(b.connBrokers))
 	for _, c := range b.connBrokers {
 		peers = append(peers, c)
@@ -839,22 +798,12 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 	}
 
 	if droneAddr == "" {
-		porta := "909" + string(droneID[len(droneID)-1])
-		droneAddr = droneID + ":" + porta
+		droneAddr = droneID + ":" + "909" + string(droneID[len(droneID)-1])
 	}
 
-	cmd := protocol.ComandoMissao{
-		OcorrenciaID: oc.ID,
-		Descricao:    oc.Descricao,
-		Prioridade:   oc.Prioridade,
-	}
+	cmd := protocol.ComandoMissao{OcorrenciaID: oc.ID, Descricao: oc.Descricao, Prioridade: oc.Prioridade}
 	payloadCmd, _ := json.Marshal(cmd)
-	msgCmd := protocol.Mensagem{
-		Tipo:      protocol.TipoComandoDrone,
-		IDOrigem:  b.id,
-		Timestamp: time.Now(),
-		Payload:   string(payloadCmd),
-	}
+	msgCmd := protocol.Mensagem{Tipo: protocol.TipoComandoDrone, IDOrigem: b.id, Timestamp: time.Now(), Payload: string(payloadCmd)}
 
 	if oc.Solicitante != "" {
 		txID := fmt.Sprintf("TX-%s-%d", oc.ID, time.Now().UnixNano())
@@ -867,7 +816,7 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 			Timestamp:    time.Now(),
 		}
 		
-		// Salva o comando físico como "pendente de confirmação de pagamento"
+		// 🧊 Salva o comando físico como "pendente de confirmação de pagamento"
 		b.mu.Lock()
 		b.missoesPendentes[tx.ID] = InfoDespacho{
 			DroneID:    droneID,
@@ -877,7 +826,9 @@ func (b *Broker) despacharDrone(oc *protocol.Ocorrencia) {
 		}
 		b.mu.Unlock()
 
-		// Propõe o bloco na rede. A decolagem acontecerá ao receber o Aceite!
+		fmt.Printf("[Broker %s] Missão de %s em Mempool. Aguardando confirmação do pagamento de %d créditos...\n", b.id, tx.De, tx.Creditos)
+
+		// Propõe o bloco na rede. A decolagem acontecerá no CommitarBloco!
 		go func() {
 			time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
 			b.proporBloco(blockchain.TipoBloco_Transacao, tx)
@@ -892,8 +843,6 @@ func (b *Broker) recolocarOcorrenciaNaFila(oc *protocol.Ocorrencia, droneID stri
 	b.mu.Lock()
 	if dr, ok := b.drones[droneID]; ok {
 		if rejeitado {
-			// Mantém o status como em_missao para que o loop do DDoS não aconteça,
-			// permitindo que o drone gerencie sua própria transição para recarga.
 			dr.Status = "em_missao"
 		} else {
 			dr.Status = "indisponivel"
@@ -901,24 +850,49 @@ func (b *Broker) recolocarOcorrenciaNaFila(oc *protocol.Ocorrencia, droneID stri
 		dr.MissaoID = ""
 	}
 
-	// Altera a prioridade para o nível mais baixo para evitar starvation das novas
 	oc.Prioridade = 3
 	b.fila.Push(oc)
-
-	// Protegido com segurança total pelo mutex principal do Broker
 	delete(b.missoesAtivas, oc.ID)
 	b.mu.Unlock()
 
-	// Aciona o agendador em background para reavaliar a fila imediatamente
 	go b.tentarDespachar()
 }
 
 // ============================================================
-// BLOCKCHAIN HANDLERS
+// RECARGA PERIÓDICA AUTOMÁTICA EM BACKGROUND
+// ============================================================
+func (b *Broker) recargaAutomaticaLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if os.Getenv("MALICIOUS") == "true" {
+			continue
+		}
+		
+		paisesLocais := obterPaisesPorBroker(strings.Replace(b.id, "broker", "", 1))
+		for _, pais := range paisesLocais {
+			saldo := b.chain.ConsultarSaldo(pais)
+			if saldo < 20 {
+				fmt.Printf("[Broker %s] ⚡ Saldo de %s crítico (%d). Injetando recarga protocolar...\n", b.id, pais, saldo)
+				txRecharge := protocol.Transacao{
+					ID:           fmt.Sprintf("RECHARGE-%s-%d", pais, time.Now().UnixNano()),
+					De:           "sistema",
+					Para:         pais,
+					Creditos:     100, // Valor fixo
+					OcorrenciaID: "SYSTEM_RECHARGE",
+					Timestamp:    time.Now(),
+				}
+				b.proporBloco(blockchain.TipoBloco_Transacao, txRecharge)
+			}
+		}
+	}
+}
+
+// ============================================================
+// BLOCKCHAIN PROPOSER E DEFENSORES
 // ============================================================
 
 func (b *Broker) proporBloco(tipoDados blockchain.TipoDados, dados interface{}) {
-	// --- CORREÇÃO: Fila de Consenso com Escape Hatch (Timeout) ---
 	inicioEspera := time.Now()
 	for {
 		b.mu.Lock()
@@ -929,7 +903,6 @@ func (b *Broker) proporBloco(tipoDados blockchain.TipoDados, dados interface{}) 
 			break
 		}
 		
-		// Se a rede travar por mais de 3 segundos, limpamos o gargalo para não congelar o sistema
 		if time.Since(inicioEspera) > 3*time.Second {
 			b.mu.Lock()
 			b.blocosPendentes = make(map[string]blockchain.Bloco)
@@ -941,11 +914,37 @@ func (b *Broker) proporBloco(tipoDados blockchain.TipoDados, dados interface{}) 
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	// 😈 SIMULAÇÃO DE ATAQUE MALICIOSO
+	if os.Getenv("MALICIOUS") == "true" {
+		ataque := rand.Intn(3)
+		switch ataque {
+		case 0:
+			tipoDados = blockchain.TipoBloco_Transacao
+			dados = protocol.Transacao{ ID: fmt.Sprintf("RENOVA-FRAUDE-%d", time.Now().UnixNano()), De: "sistema", Para: "b5-australia", Creditos: 5, OcorrenciaID: "ATAQUE-SALAMI", Timestamp: time.Now() }
+			fmt.Printf("\n[Broker %s] 😈 VILÃO: Tentando ataque Salami para b5-australia\n", b.id)
+		case 1:
+			bloco, _ := b.chain.ProporBloco(tipoDados, dados, b.id)
+			bloco.HashAnterior = "deadbeef00000000000000000000000000000000000000000000000000000000"
+			fmt.Printf("\n[Broker %s] 😈 VILÃO: Tentando criar fork estrutural\n", b.id)
+			b.propagarBloco(bloco)
+			return
+		case 2:
+			bloco, _ := b.chain.ProporBloco(tipoDados, dados, b.id)
+			bloco.Dados = `{"mensagem":"Laudo forjado pós-assinatura!"}`
+			fmt.Printf("\n[Broker %s] 😈 VILÃO: Tentando quebrar integridade do payload\n", b.id)
+			b.propagarBloco(bloco)
+			return
+		}
+	}
+
 	bloco, err := b.chain.ProporBloco(tipoDados, dados, b.id)
 	if err != nil {
 		return
 	}
+	b.propagarBloco(bloco)
+}
 
+func (b *Broker) propagarBloco(bloco blockchain.Bloco) {
 	b.mu.Lock()
 	b.blocosPendentes[bloco.Hash] = bloco
 	b.votosBloco[bloco.Hash] = 1
@@ -961,12 +960,7 @@ func (b *Broker) proporBloco(tipoDados blockchain.TipoDados, dados interface{}) 
 	}
 
 	blocoJSON, _ := json.Marshal(bloco)
-	msg := protocol.Mensagem{
-		Tipo:      protocol.TipoNovoBloco,
-		IDOrigem:  b.id,
-		Timestamp: time.Now(),
-		Payload:   string(blocoJSON),
-	}
+	msg := protocol.Mensagem{Tipo: protocol.TipoNovoBloco, IDOrigem: b.id, Timestamp: time.Now(), Payload: string(blocoJSON)}
 	for _, c := range peers {
 		_ = c.enviar(msg)
 	}
@@ -978,19 +972,75 @@ func (b *Broker) handleNovoBloco(msg protocol.Mensagem) {
 		return
 	}
 
+	// 🛡️ DEFESA 1: Evita Forking (Abre a porta de Sincronização)
 	ultimoBloco := b.chain.UltimoBloco()
 	if bloco.HashAnterior != ultimoBloco.Hash {
+		fmt.Printf("\n[Broker %s] 🛡️ REJEITADO: Falha de Forking vinda do nó %s\n", b.id, msg.IDOrigem)
+		b.mu.Lock()
+		b.esperandoSync = true
+		b.mu.Unlock()
 		b.solicitarChain()
 		return
+	}
+
+	// 🛡️ DEFESA 2: Integridade Criptográfica
+	if blockchain.CalcularHash(bloco) != bloco.Hash {
+		fmt.Printf("\n[Broker %s] 🛡️ REJEITADO: Quebra de integridade criptográfica do nó %s\n", b.id, msg.IDOrigem)
+		return
+	}
+
+	// 🛡️ DEFESAS FINANCEIRAS E ANTI-SALAMI
+	if bloco.TipoDados == blockchain.TipoBloco_Transacao {
+		var tx protocol.Transacao
+		if err := json.Unmarshal([]byte(bloco.Dados), &tx); err == nil {
+			
+			if tx.De == "sistema" {
+				if strings.HasPrefix(tx.ID, "RENOVA-") {
+					if tx.Creditos > 5 {
+						fmt.Printf("\n[Broker %s] 🛡️ REJEITADO: Recompensa de Ricart-Agrawala inflada (Origem: %s)\n", b.id, msg.IDOrigem)
+						return
+					}
+					
+					// 🛡️ ANTI-SALAMI: Usa ObterBlocos() para segurança de concorrência na Chain
+					blocosHistoricos := b.chain.ObterBlocos()
+					for _, blk := range blocosHistoricos {
+						if blk.TipoDados == blockchain.TipoBloco_Transacao {
+							var txHistorica protocol.Transacao
+							if json.Unmarshal([]byte(blk.Dados), &txHistorica) == nil {
+								if txHistorica.OcorrenciaID == tx.OcorrenciaID && txHistorica.De == "sistema" && strings.HasPrefix(txHistorica.ID, "RENOVA-") {
+									fmt.Printf("\n[Broker %s] 🛡️ BLOQUEIO: Ataque Salami interceptado! Ocorrência '%s' já foi paga. Voto Negado para %s\n", b.id, tx.OcorrenciaID, msg.IDOrigem)
+									return
+								}
+							}
+						}
+					}
+				} else if tx.OcorrenciaID == "SYSTEM_RECHARGE" {
+					if tx.Creditos != 100 {
+						fmt.Printf("\n[Broker %s] 🛡️ REJEITADO: Recarga do sistema com valor ilegal do nó %s\n", b.id, msg.IDOrigem)
+						return
+					}
+					if b.chain.ConsultarSaldo(tx.Para) >= 20 {
+						fmt.Printf("\n[Broker %s] 🛡️ REJEITADO: Recarga inválida! %s possui saldo suficiente (%d)\n", b.id, tx.Para, b.chain.ConsultarSaldo(tx.Para))
+						return
+					}
+				} else {
+					return // Recusa injeções sistêmicas desconhecidas
+				}
+			} else if tx.De != "" {
+				// Auditoria Financeira Rígida na Votação
+				if b.chain.ConsultarSaldo(tx.De) < tx.Creditos {
+					fmt.Printf("\n[Broker %s] 🛡️ REJEITADO: Tentativa de Duplo-Gasto! %s sem fundos no ledger. (Origem: %s)\n", b.id, tx.De, msg.IDOrigem)
+					return 
+				}
+			}
+		}
 	}
 
 	b.mu.Lock()
 	if _, ok := b.blocosPendentes[bloco.Hash]; !ok {
 		b.blocosPendentes[bloco.Hash] = bloco
-		// --- CORREÇÃO: Adiciona o voto implícito de quem propôs o bloco ---
 		b.votosBloco[bloco.Hash] = 1 
 	}
-	// Adiciona o nosso próprio voto de aceite
 	b.votosBloco[bloco.Hash]++
 	votos := b.votosBloco[bloco.Hash]
 	total := len(b.connBrokers) + 1
@@ -1002,7 +1052,6 @@ func (b *Broker) handleNovoBloco(msg protocol.Mensagem) {
 		Timestamp: time.Now(),
 		Payload:   fmt.Sprintf(`{"hash":"%s"}`, bloco.Hash),
 	}
-
 	for _, peerConn := range b.peersAtivos() {
 		_ = peerConn.enviar(aceite)
 	}
@@ -1014,12 +1063,8 @@ func (b *Broker) handleNovoBloco(msg protocol.Mensagem) {
 }
 
 func (b *Broker) handleAceiteBloco(msg protocol.Mensagem) {
-	var payload struct {
-		Hash string `json:"hash"`
-	}
-	if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil {
-		return
-	}
+	var payload struct{ Hash string `json:"hash"` }
+	if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil { return }
 
 	b.mu.Lock()
 	b.votosBloco[payload.Hash]++
@@ -1028,14 +1073,8 @@ func (b *Broker) handleAceiteBloco(msg protocol.Mensagem) {
 	bloco, existe := b.blocosPendentes[payload.Hash]
 	b.mu.Unlock()
 
-	if !existe {
-		return
-	}
-
-	quorum := total/2 + 1
-	if votos >= quorum {
-		b.commitarBloco(bloco)
-	}
+	if !existe { return }
+	if votos >= (total/2 + 1) { b.commitarBloco(bloco) }
 }
 
 func (b *Broker) commitarBloco(bloco blockchain.Bloco) {
@@ -1058,24 +1097,37 @@ func (b *Broker) commitarBloco(bloco blockchain.Bloco) {
 			
 			sucessoDebito := true
 
-			// Débitos (Pagamento padrão de missão)
+			// Débitos (Pagamento da missão e Fallback Solo)
 			if tx.De != "sistema" && tx.De != "" {
 				if err := b.chain.DebitarCreditos(tx.De, tx.Creditos); err != nil {
-					fmt.Printf("[Broker %s] RECUSADO. Companhia %s falhou no pagamento: %v\n", b.id, tx.De, err)
-					sucessoDebito = false
+					
+					// Verifica se estamos no Modo Solo Salvavidas
+					b.mu.Lock()
+					totalAtivos := 0
+					for id := range b.connBrokers {
+						if !strings.HasPrefix(id, "tester") { totalAtivos++ }
+					}
+					b.mu.Unlock()
+
+					if totalAtivos == 0 {
+						fmt.Printf("[Broker %s] 🌐 FALLBACK MODO SOLO: Saldo insuficiente de %s, mas liberando despacho por emergência!\n", b.id, tx.De)
+					} else {
+						fmt.Printf("[Broker %s] ⛔ RECUSADO. %s falhou no pagamento: %v\n", b.id, tx.De, err)
+						sucessoDebito = false
+					}
+
 				} else {
 					fmt.Printf("[Broker %s] Créditos debitados da companhia: %s\n", b.id, tx.De)
 				}
 			}
 			
-			// Créditos (Recompensas de Ricart-Agrawala)
+			// Créditos (Recompensas e Bailout)
 			if tx.Para != "sistema" && tx.Para != "" {
 				b.chain.CreditarSaldo(tx.Para, tx.Creditos)
 			}
 
 			// ========================================================
-			// TRIGGER: Despacha o drone físico apenas se a transação
-			// processada pertencia a este Broker E se o débito passou!
+			// TRIGGER ASÍNCRONO DA SUA ARQUITETURA
 			// ========================================================
 			b.mu.Lock()
 			info, eraDesteBroker := b.missoesPendentes[tx.ID]
@@ -1086,7 +1138,7 @@ func (b *Broker) commitarBloco(bloco blockchain.Bloco) {
 
 			if eraDesteBroker {
 				if sucessoDebito {
-					fmt.Printf("[Broker %s] Pagamento confirmado (%s). Autorizando decolagem de %s!\n", b.id, tx.ID, info.DroneID)
+					fmt.Printf("[Broker %s] Pagamento confirmado na rede! Autorizando decolagem...\n", b.id)
 					go b.enviarComandoFisicoDrone(info.DroneID, info.DroneAddr, info.Ocorrencia, info.Comando)
 				} else {
 					fmt.Printf("[Broker %s] Cancelando despacho do %s por falta de fundos. Devolvendo ocorrência.\n", b.id, info.DroneID)
@@ -1099,26 +1151,25 @@ func (b *Broker) commitarBloco(bloco blockchain.Bloco) {
 
 func (b *Broker) handleReqChain(cs *connSegura) {
 	chainJSON, err := b.chain.SerializarChain()
-	if err != nil {
-		return
-	}
-	_ = cs.enviar(protocol.Mensagem{
-		Tipo:      protocol.TipoRespChain,
-		IDOrigem:  b.id,
-		Timestamp: time.Now(),
-		Payload:   chainJSON,
-	})
+	if err != nil { return }
+	_ = cs.enviar(protocol.Mensagem{Tipo: protocol.TipoRespChain, IDOrigem: b.id, Timestamp: time.Now(), Payload: chainJSON})
 }
 
 func (b *Broker) handleRespChain(msg protocol.Mensagem) {
-	var blocos []blockchain.Bloco
-	if err := json.Unmarshal([]byte(msg.Payload), &blocos); err != nil {
+	b.mu.Lock()
+	if !b.esperandoSync {
+		b.mu.Unlock()
+		// 🛡️ BARRADO: The Engineer Attack mitigado!
+		fmt.Printf("\n[Broker %s] ⛔ HACK REJEITADO: Nós não solicitamos sincronização de chain do nó %s.\n", b.id, msg.IDOrigem)
 		return
 	}
-	
-	// Gera a base de dados dinamicamente usando os países configurados
-	saldosBase := gerarSaldosIniciais(b.mapaRede)
+	b.esperandoSync = false // Fecha a porta imediatamente
+	b.mu.Unlock()
 
+	var blocos []blockchain.Bloco
+	if err := json.Unmarshal([]byte(msg.Payload), &blocos); err != nil { return }
+	
+	saldosBase := gerarSaldosIniciais(b.mapaRede)
 	if b.chain.SubstituirChain(blocos, saldosBase) {
 		fmt.Printf("[Broker %s] [Chain] Sincronizada: %d blocos\n", b.id, b.chain.Tamanho())
 	}
@@ -1126,88 +1177,54 @@ func (b *Broker) handleRespChain(msg protocol.Mensagem) {
 
 func (b *Broker) handleConsultaSaldo(cs *connSegura, msg protocol.Mensagem) {
 	saldo := b.chain.ConsultarSaldo(msg.IDOrigem)
-	_ = cs.enviar(protocol.Mensagem{
-		Tipo:      protocol.TipoRespSaldo,
-		IDOrigem:  b.id,
-		Timestamp: time.Now(),
-		Payload:   fmt.Sprintf(`{"companhia":"%s","saldo":%d}`, msg.IDOrigem, saldo),
-	})
+	_ = cs.enviar(protocol.Mensagem{Tipo: protocol.TipoRespSaldo, IDOrigem: b.id, Timestamp: time.Now(), Payload: fmt.Sprintf(`{"companhia":"%s","saldo":%d}`, msg.IDOrigem, saldo)})
 }
 
 func (b *Broker) solicitarChain() {
 	peers := b.peersAtivos()
 	for _, c := range peers {
-		_ = c.enviar(protocol.Mensagem{
-			Tipo:      protocol.TipoReqChain,
-			IDOrigem:  b.id,
-			Timestamp: time.Now(),
-		})
+		_ = c.enviar(protocol.Mensagem{Tipo: protocol.TipoReqChain, IDOrigem: b.id, Timestamp: time.Now()})
 	}
 }
-
-// ============================================================
-// HEARTBEAT E MONITORAMENTO DE PEERS
-// ============================================================
 
 func (b *Broker) heartbeatLoop() {
 	ticker := time.NewTicker(intervaloHeartbeat)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		peers := b.peersAtivos()
-		msg := protocol.Mensagem{
-			Tipo:      protocol.TipoHeartbeat,
-			IDOrigem:  b.id,
-			Timestamp: time.Now(),
-		}
-		for _, c := range peers {
-			_ = c.enviar(msg)
-		}
+		msg := protocol.Mensagem{Tipo: protocol.TipoHeartbeat, IDOrigem: b.id, Timestamp: time.Now()}
+		for _, c := range peers { _ = c.enviar(msg) }
 	}
 }
 
 func (b *Broker) monitorarPeers() {
 	ticker := time.NewTicker(intervaloHeartbeat)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		b.mu.Lock()
 		var mortos []string
 		for id, t := range b.ultimoHB {
-			if time.Since(t) > timeoutHeartbeat {
-				mortos = append(mortos, id)
-			}
+			if time.Since(t) > timeoutHeartbeat { mortos = append(mortos, id) }
 		}
 		b.mu.Unlock()
 
 		for _, id := range mortos {
 			fmt.Printf("[Broker %s] Peer %s não responde. Removendo.\n", b.id, id)
 			b.mu.Lock()
-			if c, ok := b.connBrokers[id]; ok {
-				c.fechar()
-			}
+			if c, ok := b.connBrokers[id]; ok { c.fechar() }
 			delete(b.connBrokers, id)
 			delete(b.ultimoHB, id)
 
 			if b.requesting {
 				delete(b.respostasOK, id)
 				delete(b.deferred, id)
-
 				totalAtivos := 0
 				for key := range b.connBrokers {
-					if !strings.HasPrefix(key, "tester") {
-						totalAtivos++
-					}
+					if !strings.HasPrefix(key, "tester") { totalAtivos++ }
 				}
-
-				// ---: Previne Double-CS em caso de queda simultânea de rede ---
 				if len(b.respostasOK) >= totalAtivos && totalAtivos > 0 {
 					b.requesting = false
-					oc := &protocol.Ocorrencia{
-						ID:         b.currentReqID,
-						Prioridade: b.currentReqRA.Prioridade,
-						Timestamp:  b.currentReqRA.Timestamp,
-					}
+					oc := &protocol.Ocorrencia{ID: b.currentReqID, Prioridade: b.currentReqRA.Prioridade, Timestamp: b.currentReqRA.Timestamp}
 					go b.entrarCS(oc)
 				}
 			}
@@ -1219,7 +1236,6 @@ func (b *Broker) monitorarPeers() {
 func (b *Broker) removerConexao(conn net.Conn, id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	delete(b.connDrones, conn)
 	delete(b.connBrokers, id)
 	delete(b.connClientes, conn)
@@ -1240,31 +1256,22 @@ func (b *Broker) encerrarSistema() {
 	b.encerrando = true
 	b.mu.Unlock()
 
-	fmt.Printf("\n[Broker %s] Encerrando...\n", b.id)
-
+	fmt.Printf("\n[Broker %s] Encerrando persistentemente...\n", b.id)
 	if err := b.chain.SalvarChain(); err != nil {
 		fmt.Printf("[Broker %s] Aviso: falha ao persistir chain no encerramento: %v\n", b.id, err)
-	} else {
-		fmt.Printf("[Broker %s] Chain persistida com sucesso (%d blocos).\n", b.id, b.chain.Tamanho())
 	}
 
 	b.mu.Lock()
-	for _, c := range b.connBrokers {
-		c.fechar()
-	}
+	for _, c := range b.connBrokers { c.fechar() }
 	b.mu.Unlock()
 	os.Exit(0)
 }
 
 func carregarConfiguracao(caminho string) (map[string]string, error) {
 	dados, err := os.ReadFile(caminho)
-	if err != nil {
-		return nil, fmt.Errorf("não foi possível ler %s: %w", caminho, err)
-	}
+	if err != nil { return nil, fmt.Errorf("não foi possível ler %s: %w", caminho, err) }
 	var mapa map[string]string
-	if err := json.Unmarshal(dados, &mapa); err != nil {
-		return nil, fmt.Errorf("config.json malformado: %w", err)
-	}
+	if err := json.Unmarshal(dados, &mapa); err != nil { return nil, fmt.Errorf("config.json malformado: %w", err) }
 	return mapa, nil
 }
 
@@ -1275,29 +1282,15 @@ func main() {
 	}
 
 	brokerID := os.Args[1]
-
 	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "/app/config.json"
-	}
+	if configPath == "" { configPath = "/app/config.json" }
 
 	mapaRede, err := carregarConfiguracao(configPath)
-	if err != nil {
-		fmt.Printf("ERRO: %v\n", err)
-		os.Exit(1)
-	}
-	if _, ok := mapaRede[brokerID]; !ok {
-		fmt.Printf("ERRO: broker '%s' não encontrado no config.json\n", brokerID)
-		os.Exit(1)
-	}
+	if err != nil { os.Exit(1) }
+	if _, ok := mapaRede[brokerID]; !ok { os.Exit(1) }
 
 	b := novoBroker(brokerID, mapaRede)
 	go b.encerrarSistema()
-
-	fmt.Printf("[Broker %s] Cluster:\n", brokerID)
-	for id, addr := range mapaRede {
-		fmt.Printf("  %s → %s\n", id, addr)
-	}
 
 	b.iniciarServidor()
 }

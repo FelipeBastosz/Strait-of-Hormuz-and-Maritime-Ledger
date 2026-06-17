@@ -179,7 +179,7 @@ func NovaChain(brokerID string, saldosIniciais map[string]int) *Chain {
 		HashAnterior: "0000000000000000",
 		Validador:    "SISTEMA",
 	}
-	genesis.Hash = calcularHash(genesis)
+	genesis.Hash = CalcularHash(genesis)
 	c.Blocos = append(c.Blocos, genesis)
 
 	fmt.Printf("[blockchain %s] Chain iniciada do zero. Bloco gênesis: %s\n", brokerID, genesis.Hash[:16])
@@ -195,7 +195,7 @@ func NovaChain(brokerID string, saldosIniciais map[string]int) *Chain {
 // HASH E BLOCOS
 // ============================================================
 
-func calcularHash(b Bloco) string {
+func CalcularHash(b Bloco) string {
 	entrada := fmt.Sprintf("%d%s%s%s%s%s",
 		b.Indice,
 		b.Timestamp.Format(time.RFC3339Nano),
@@ -227,7 +227,7 @@ func (c *Chain) ProporBloco(tipoDados TipoDados, dados interface{}, validador st
 		HashAnterior: ultimoBloco.Hash,
 		Validador:    validador,
 	}
-	novo.Hash = calcularHash(novo)
+	novo.Hash = CalcularHash(novo)
 
 	return novo, nil
 }
@@ -246,7 +246,7 @@ func (c *Chain) CommitarBloco(b Bloco) error {
 		return fmt.Errorf("hash anterior inválido: esperado %s, recebido %s", ultimo.Hash[:16], b.HashAnterior[:16])
 	}
 
-	hashCalculado := calcularHash(b)
+	hashCalculado := CalcularHash(b)
 	if hashCalculado != b.Hash {
 		c.mu.Unlock() // Libera antes de retornar erro
 		return fmt.Errorf("hash do bloco adulterado: calculado %s, recebido %s", hashCalculado[:16], b.Hash[:16])
@@ -338,7 +338,7 @@ func (c *Chain) ValidarChain() bool {
 			return false
 		}
 
-		if calcularHash(atual) != atual.Hash {
+		if CalcularHash(atual) != atual.Hash {
 			fmt.Printf("[blockchain %s] ADULTERAÇÃO detectada no bloco #%d: hash adulterado\n",
 				c.DroneID, atual.Indice)
 			return false
@@ -360,7 +360,7 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 			fmt.Printf("[blockchain %s] Chain recebida inválida no bloco #%d\n", c.DroneID, i)
 			return false
 		}
-		if calcularHash(nova[i]) != nova[i].Hash {
+		if CalcularHash(nova[i]) != nova[i].Hash {
 			fmt.Printf("[blockchain %s] Hash adulterado na chain recebida, bloco #%d\n", c.DroneID, i)
 			return false
 		}
@@ -375,10 +375,16 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 		if bloco.TipoDados == TipoBloco_Transacao {
 			var tx struct {
 				De       string `json:"de"`
+				Para     string `json:"para"` // <--- Reconhecendo o campo
 				Creditos int    `json:"creditos"`
 			}
 			if err := json.Unmarshal([]byte(bloco.Dados), &tx); err == nil {
-				c.Saldos[tx.De] -= tx.Creditos
+				if tx.De != "sistema" && tx.De != "" {
+					c.Saldos[tx.De] -= tx.Creditos
+				}
+				if tx.Para != "sistema" && tx.Para != "" {
+					c.Saldos[tx.Para] += tx.Creditos // <--- Recriando a recompensa
+				}
 			}
 		}
 	}

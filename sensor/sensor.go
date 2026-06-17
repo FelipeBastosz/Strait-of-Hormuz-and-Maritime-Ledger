@@ -1,14 +1,3 @@
-// ============================================================
-// SENSOR — Detector automático de incidentes
-//
-// Baseado no sensor de Felipe.
-// Gera ocorrências com distribuição realista de prioridades e
-// as envia ao broker via TLS. Sensores do Problema 3 preenchem
-// também Solicitante e Creditos para acionar a validação da blockchain.
-//
-// Argumentos: [ID_SENSOR] [ID_SETOR] [ENDERECO_BROKER]
-// ============================================================
-
 package main
 
 import (
@@ -18,12 +7,12 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"Strait-of-Hormuz-and-Maritime-Ledger/protocol"
 )
 
-// Tipos de ocorrências reais do domínio do Estreito de Ormuz
 var tiposOcorrencia = []string{
 	"Suspeita de bloqueio parcial de rota",
 	"Falha de sinalização marítima",
@@ -36,24 +25,37 @@ var tiposOcorrencia = []string{
 	"Possível mina à deriva na rota principal",
 }
 
-// Companhias cadastradas no ledger — sensors rotacionam entre elas para simular tráfego real
-var companhias = []string{
-	"companhia-a",
-	"companhia-b",
-	"companhia-c",
-	"companhia-d",
+func obterPaisesPorBroker(numBroker string) []string {
+	prefixo := "b" + numBroker + "-"
+	switch numBroker {
+	case "1":
+		return []string{prefixo + "alemanha", prefixo + "franca", prefixo + "italia", prefixo + "inglaterra"}
+	case "2":
+		return []string{prefixo + "china", prefixo + "japao", prefixo + "india", prefixo + "emirados"}
+	case "3":
+		return []string{prefixo + "eua", prefixo + "canada", prefixo + "brasil", prefixo + "argentina"}
+	case "4":
+		return []string{prefixo + "egito", prefixo + "somalia", prefixo + "djibuti", prefixo + "africadosul"}
+	case "5":
+		return []string{prefixo + "australia", prefixo + "novazelandia", prefixo + "indonesia", prefixo + "filipinas"}
+	default:
+		return []string{prefixo + "desconhecido"}
+	}
 }
 
 func main() {
 	if len(os.Args) < 4 {
 		fmt.Println("Uso: sensor [ID_SENSOR] [ID_SETOR] [ENDERECO_BROKER]")
-		fmt.Println("Exemplo: sensor S1A setor-1 broker1:9081")
 		return
 	}
 
 	sensorID := os.Args[1]
 	setorID := os.Args[2]
 	enderecoBroker := os.Args[3]
+
+	host := strings.Split(enderecoBroker, ":")[0]
+	numBroker := strings.Replace(host, "broker", "", 1)
+	paisesDoSetor := obterPaisesPorBroker(numBroker)
 
 	intervaloMin := 15
 	if v := os.Getenv("SENSOR_INTERVALO_MIN"); v != "" {
@@ -66,6 +68,7 @@ func main() {
 
 	fmt.Printf("[Sensor %s | Setor %s] Iniciado → broker %s | intervalo %d–%ds\n",
 		sensorID, setorID, enderecoBroker, intervaloMin, intervaloMax)
+	fmt.Printf("[Sensor %s] Países operantes no setor: %v\n", sensorID, paisesDoSetor)
 
 	rand.Seed(time.Now().UnixNano())
 	contador := 0
@@ -77,7 +80,7 @@ func main() {
 		contador++
 		prioridade := gerarPrioridade()
 		descricao := tiposOcorrencia[rand.Intn(len(tiposOcorrencia))]
-		solicitante := companhias[rand.Intn(len(companhias))]
+		solicitante := paisesDoSetor[rand.Intn(len(paisesDoSetor))]
 
 		ocorrencia := protocol.Ocorrencia{
 			ID:          fmt.Sprintf("%s-OC%04d", sensorID, contador),
@@ -86,16 +89,13 @@ func main() {
 			Descricao:   descricao,
 			Setor:       setorID,
 			Solicitante: solicitante,
-			Creditos:    10, // Custo padrão de escolta
+			Creditos:    10, // Custo fixo da escolta marítima
 		}
 
 		enviarOcorrencia(enderecoBroker, ocorrencia, sensorID)
 	}
 }
 
-// gerarPrioridade retorna uma prioridade com distribuição realista:
-//
-//	60% Aviso (1), 30% Alerta (2), 10% Crítico (3)
 func gerarPrioridade() int {
 	n := rand.Intn(100)
 	if n < 10 {
@@ -109,7 +109,6 @@ func gerarPrioridade() int {
 func enviarOcorrencia(enderecoBroker string, oc protocol.Ocorrencia, sensorID string) {
 	payload, err := json.Marshal(oc)
 	if err != nil {
-		fmt.Printf("[Sensor %s] Erro ao serializar: %v\n", sensorID, err)
 		return
 	}
 
@@ -120,25 +119,22 @@ func enviarOcorrencia(enderecoBroker string, oc protocol.Ocorrencia, sensorID st
 		Payload:   string(payload),
 	}
 
-	// Tenta conexão TLS primeiro; fallback para TCP puro em dev local
 	var conn net.Conn
 	tlsCfg := &tls.Config{InsecureSkipVerify: true}
 	conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", enderecoBroker, tlsCfg)
 	if err != nil {
 		conn, err = net.DialTimeout("tcp", enderecoBroker, 2*time.Second)
 		if err != nil {
-			fmt.Printf("[Sensor %s] Broker %s indisponível: %v\n", sensorID, enderecoBroker, err)
 			return
 		}
 	}
 	defer conn.Close()
 
 	if err := json.NewEncoder(conn).Encode(msg); err != nil {
-		fmt.Printf("[Sensor %s] Erro ao enviar: %v\n", sensorID, err)
 		return
 	}
 
 	prioLabel := map[int]string{1: "Aviso", 2: "Alerta", 3: "CRÍTICO"}
-	fmt.Printf("[Sensor %s | %s] ▶ %s enviada — %s [P%d] | solicitante: %s\n",
+	fmt.Printf("[Sensor %s | %s] ▶ %s enviada — %s [P%d] | país: %s\n",
 		sensorID, oc.Setor, oc.ID, prioLabel[oc.Prioridade], oc.Prioridade, oc.Solicitante)
 }

@@ -335,10 +335,12 @@ func (t *Tester) enviarRequisicao(addr string, prioridade int, n int, companhia 
 		}
 		fmt.Printf("[REQ] enviada #%d  prio=%d  broker=%s  solicitante=%s\n",
 			i+1, prioridade, addr, companhia)
-		time.Sleep(50 * time.Millisecond)
+			
+		// 🐌 DESACELERADOR: 2 segundos de respiro para visualizar os consensos e a decolagem.
+		time.Sleep(2000 * time.Millisecond)
 	}
 }
-
+		
 func (t *Tester) enviarRAOK(addr, brokerID string) {
 	cs, ok := t.connPara(addr)
 	if !ok {
@@ -510,7 +512,9 @@ func (t *Tester) cli() {
 			addr := partes[1]
 			prio, _ := strconv.Atoi(partes[2])
 			n, _ := strconv.Atoi(partes[3])
-			companhia := "companhia-a"
+			
+			// 🌍 NOME PADRÃO AJUSTADO AQUI:
+			companhia := "b1-alemanha"
 			if len(partes) >= 5 {
 				companhia = partes[4]
 			}

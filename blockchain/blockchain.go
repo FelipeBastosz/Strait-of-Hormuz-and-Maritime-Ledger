@@ -256,7 +256,7 @@ func (c *Chain) CommitarBloco(b Bloco) error {
 	fmt.Printf("[blockchain %s] Bloco #%d commitado. Hash: %s | Tipo: %s\n",
 		c.DroneID, b.Indice, b.Hash[:16], b.TipoDados)
 
-	c.mu.Unlock() // <-- CORREÇÃO AQUI: Libera o lock ANTES de chamar SalvarChain
+	c.mu.Unlock() // Libera o lock ANTES de chamar SalvarChain
 
 	// Agora é seguro chamar SalvarChain (que exige o RLock internamente)
 	if err := c.SalvarChain(); err != nil {
@@ -375,7 +375,7 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 		if bloco.TipoDados == TipoBloco_Transacao {
 			var tx struct {
 				De       string `json:"de"`
-				Para     string `json:"para"` // <--- Reconhecendo o campo
+				Para     string `json:"para"`
 				Creditos int    `json:"creditos"`
 			}
 			if err := json.Unmarshal([]byte(bloco.Dados), &tx); err == nil {
@@ -383,7 +383,7 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 					c.Saldos[tx.De] -= tx.Creditos
 				}
 				if tx.Para != "sistema" && tx.Para != "" {
-					c.Saldos[tx.Para] += tx.Creditos // <--- Recriando a recompensa
+					c.Saldos[tx.Para] += tx.Creditos
 				}
 			}
 		}
@@ -436,4 +436,21 @@ func (c *Chain) UltimoBloco() Bloco {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Blocos[len(c.Blocos)-1]
+}
+
+// ============================================================
+// SEGURANÇA CONTRA FRAUDES E CONCORRÊNCIA
+// ============================================================
+
+// ObterBlocos retorna uma cópia completa e segura dos blocos armazenados na memória.
+// Fundamental para a auditoria de histórico (defesa contra ataque Salami) 
+// sem travar a cadeia inteira de blocos durante a varredura do histórico.
+func (c *Chain) ObterBlocos() []Bloco {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
+	copia := make([]Bloco, len(c.Blocos))
+	copy(copia, c.Blocos)
+	
+	return copia
 }

@@ -372,5 +372,6 @@ services:
       - broker2
       - broker3
       - broker4
+      - broker5
     stdin_open: true
     tty: true

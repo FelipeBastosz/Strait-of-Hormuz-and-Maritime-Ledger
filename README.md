@@ -106,25 +106,25 @@ Os diagramas de sequência abaixo detalham o ciclo de vida completo de uma ocorr
 
 Do recebimento da ocorrência até a decolagem do drone, passando pela disputa de Ricart-Agrawala, o consenso PoA para o bloco de transação, o débito de créditos, o despacho físico, a execução da missão e o segundo bloco (o laudo) que encerra o fluxo com a persistência da chain em disco.
 
-![Ciclo de vida completo de uma ocorrência](Docs/diagrama_fluxo_completo.jpg)
+![Ciclo de vida completo de uma ocorrência](Docs/diagrama_fluxo_completo.jpeg)
 
 ### 2. Defesa contra Duplo-Gasto
 
 Um broker malicioso (ou dessincronizado) tenta propagar uma transação debitando créditos de uma companhia sem saldo suficiente. Cada broker honesto realiza uma **auditoria financeira rígida** antes de votar — consulta o saldo real no próprio ledger e nega o aceite. Sem quórum de maioria, o bloco fraudulento nunca é commitado e a transação é descartada do mempool.
 
-![Defesa contra ataque de duplo-gasto](Docs/diagrama_defesa_duplo_gasto.jpg)
+![Defesa contra ataque de duplo-gasto](Docs/diagrama_defesa_duplo_gasto.jpeg)
 
 ### 3. Defesa contra Ataque Salami
 
 Um broker malicioso tenta cobrar a recompensa de renovação do Ricart-Agrawala duas vezes pela mesma ocorrência (`RENOVA-OC001`). Antes de validar a transação, o broker honesto identifica que é uma transação de sistema e faz uma **varredura completa do histórico de blocos** (`ObterBlocos()`), encontra o pagamento original e bloqueia o voto — interceptando o ataque Salami antes que ele drene o fundo operacional em pequenos incrementos repetidos.
 
-![Defesa contra ataque Salami](Docs/diagrama_defesa_anti_salami.jpg)
+![Defesa contra ataque Salami](Docs/diagrama_defesa_anti_salami.jpeg)
 
 ### 4. Defesa contra Forking e Recuperação após Crash
 
 Um broker detecta que o `hash_anterior` de um bloco recebido não corresponde ao seu próprio topo de chain — sinal de um fork. Ele ativa a trava `esperandoSync`, solicita a chain completa aos peers e, ao receber a primeira resposta válida, substitui sua cadeia local e **fecha a trava imediatamente**. Qualquer chain forjada que chegue depois da janela de sincronização (como a tentativa do atacante de sobrescrever a cadeia válida com uma forjada de 999 blocos) é rejeitada, pois o broker não está mais esperando sincronização.
 
-![Defesa contra forking e recuperação após crash](Docs/diagrama_defesa_anti_forking.jpg)
+![Defesa contra forking e recuperação após crash](Docs/diagrama_defesa_anti_forking.jpeg)
 
 ---
 

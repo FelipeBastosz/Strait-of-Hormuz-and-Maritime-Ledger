@@ -122,7 +122,7 @@ services:
     networks:
       - ormuz-net
     ports:
-      - "0.0.0.0:9085:9085"
+      - "0.0.0.0:9185:9085"
     restart: on-failure
 
   # ==========================================================
@@ -364,7 +364,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.tester
-    command: ["broker1:9081", "broker2:9082", "broker3:9083", "broker4:9084"]
+    command: ["broker1:9081", "broker2:9082", "broker3:9083", "broker4:9084", "broker5:9085"]
     networks:
       - ormuz-net
     depends_on:

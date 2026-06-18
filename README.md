@@ -81,14 +81,20 @@ Toda comunicação roda sobre **TCP + TLS**, usando o envelope universal `protoc
 
 O sistema é dividido em 8 componentes principais:
 
-1. **Broker (×5):** nó totalmente descentralizado. Disputa drones via Ricart-Agrawala, propõe e audita blocos, mantém heartbeat com os pares e persiste seu próprio ledger.
-2. **Drone (×5):** atuador compartilhado por todo o cluster. Aceita o primeiro comando válido recebido e reporta o laudo a todos os brokers conhecidos.
-3. **Sensor (×8):** dois sensores por setor (1 a 4), gerando ocorrências automáticas com prioridade e companhia aleatórias.
-4. **Client:** terminal interativo TCP para injetar ocorrências manualmente, trocar de companhia ativa e consultar saldo.
-5. **Tester:** ferramenta de diagnóstico — mede latência (RTT), injeta requisições em lote, opera o Ricart-Agrawala em modo manual e audita a blockchain em tempo real.
-6. **Protocol:** pacote compartilhado com o envelope de mensagens e as structs de domínio (ocorrência, drone, transação, laudo, requisição RA).
-7. **Blockchain:** ledger encadeado por hash (SHA-256), com saldos por companhia, validação de integridade e persistência atômica.
-8. **State:** fila de prioridade (heap) com *aging*, usada para ordenar as ocorrências aguardando despacho.
+1. **Broker (×5):** ...
+2. **Drone (×5):** ...
+3. **Sensor (×8):** ...
+4. **Client:** ...
+5. **Tester:** ...
+6. **Protocol:** ...
+7. **Blockchain:** ...
+8. **State:** ...
+
+### Arquitetura Geral
+
+O diagrama abaixo apresenta uma visão macro da arquitetura distribuída do sistema. Cada broker mantém sua própria blockchain e coordena o acesso aos drones compartilhados por meio do algoritmo de Ricart-Agrawala. Sensores e clientes geram ocorrências, que entram em uma fila de requisições até que um drone seja reservado, execute a missão e registre o laudo na blockchain. (**Obs**: O Broker 5 não é registrado na Arquitetura Geral em razão do seu papel de validação de casos de erro).
+
+<img width="850" height="800" alt="PBL2 Go - Arquitetura Geral(2)" src="https://github.com/user-attachments/assets/38cd7cb6-8dc2-4bf2-8e82-b4ea6464fe60" />
 
 ---
 

@@ -7,7 +7,7 @@
 # 1. Sobe APENAS a infraestrutura base (Brokers, Drones, Client e Tester)
 # Sem os sensores automáticos. Ambiente perfeito para depurar manualmente.
 up-test:
-	docker-compose up --build -d broker1 broker2 broker3 broker4 drone1 drone2 drone3 drone4 client tester
+	docker-compose up --build -d broker1 broker2 broker3 broker4 broker5 drone1 drone2 drone3 drone4 drone5 client tester
 	@echo "✅ Ambiente controlado iniciado em background (Sensores OFF)."
 	@echo "🔍 Use 'make logs' para ver a rede ou 'make tester' para injetar comandos."
 

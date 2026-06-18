@@ -1,0 +1,198 @@
+networks:
+  ormuz-net:
+    driver: bridge
+
+volumes:
+  state-broker3:
+  state-broker4:
+  state-broker5:
+
+services:
+  # ── BROKERS (PC 2) ────────────────────────────────────────
+  broker3:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    command: ["3"]
+    environment:
+      CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
+    volumes:
+      - state-broker3:/app/state
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "9083:9083"
+    restart: on-failure
+
+  broker4:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    command: ["4"]
+    environment:
+      CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
+    volumes:
+      - state-broker4:/app/state
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "9084:9084"
+    restart: on-failure
+
+  broker5:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    command: ["5"]
+    environment:
+      CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
+      MALICIOUS: "true"
+    volumes:
+      - state-broker5:/app/state
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "9085:9085"
+    restart: on-failure
+
+  # ── DRONES (PC 2) ─────────────────────────────────────────
+  drone3:
+    build:
+      context: .
+      dockerfile: Dockerfile.drone
+    command: [
+      "drone3", "172.16.201.13:9093", 
+      "172.16.201.14:9081", "172.16.201.14:9082", 
+      "broker3:9083", "broker4:9084", "broker5:9085"
+    ]
+    environment:
+      CONFIG_PATH: /app/config.json
+    volumes:
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "9093:9093"
+    depends_on:
+      - broker3
+    restart: on-failure
+
+  drone4:
+    build:
+      context: .
+      dockerfile: Dockerfile.drone
+    command: [
+      "drone4", "172.16.201.13:9094", 
+      "172.16.201.14:9081", "172.16.201.14:9082", 
+      "broker3:9083", "broker4:9084", "broker5:9085"
+    ]
+    environment:
+      CONFIG_PATH: /app/config.json
+    volumes:
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "9094:9094"
+    depends_on:
+      - broker4
+    restart: on-failure
+
+  drone5:
+    build:
+      context: .
+      dockerfile: Dockerfile.drone
+    command: [
+      "drone5", "172.16.201.13:9095", 
+      "172.16.201.14:9081", "172.16.201.14:9082", 
+      "broker3:9083", "broker4:9084", "broker5:9085"
+    ]
+    environment:
+      CONFIG_PATH: /app/config.json
+    volumes:
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "9095:9095"
+    depends_on:
+      - broker5
+    restart: on-failure
+
+  # ── SENSORES (PC 2) ───────────────────────────────────────
+  sensor-s3a:
+    build:
+      context: .
+      dockerfile: Dockerfile.sensor
+    command: ["S3A", "setor-3", "broker3:9083"]
+    environment:
+      SENSOR_INTERVALO_MIN: "20"
+      SENSOR_INTERVALO_MAX: "25"
+    networks:
+      - ormuz-net
+    depends_on:
+      - broker3
+    restart: on-failure
+
+  sensor-s3b:
+    build:
+      context: .
+      dockerfile: Dockerfile.sensor
+    command: ["S3B", "setor-3", "broker3:9083"]
+    environment:
+      SENSOR_INTERVALO_MIN: "10"
+      SENSOR_INTERVALO_MAX: "15"
+    networks:
+      - ormuz-net
+    depends_on:
+      - broker3
+    restart: on-failure
+
+  sensor-s4a:
+    build:
+      context: .
+      dockerfile: Dockerfile.sensor
+    command: ["S4A", "setor-4", "broker4:9084"]
+    environment:
+      SENSOR_INTERVALO_MIN: "16"
+      SENSOR_INTERVALO_MAX: "22"
+    networks:
+      - ormuz-net
+    depends_on:
+      - broker4
+    restart: on-failure
+
+  sensor-s4b:
+    build:
+      context: .
+      dockerfile: Dockerfile.sensor
+    command: ["S4B", "setor-4", "broker4:9084"]
+    environment:
+      SENSOR_INTERVALO_MIN: "10"
+      SENSOR_INTERVALO_MAX: "15"
+    networks:
+      - ormuz-net
+    depends_on:
+      - broker4
+    restart: on-failure
+
+  # ── FERRAMENTA DE DIAGNÓSTICO (PC 2) ──────────────────────
+  tester:
+    build:
+      context: .
+      dockerfile: Dockerfile.tester
+    command: ["172.16.201.14:9081", "172.16.201.14:9082", "broker3:9083", "broker4:9084", "broker5:9085"]
+    networks:
+      - ormuz-net
+    depends_on:
+      - broker3
+      - broker4
+      - broker5
+    stdin_open: true
+    tty: true

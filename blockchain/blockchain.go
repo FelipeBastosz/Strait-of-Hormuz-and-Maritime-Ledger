@@ -1,16 +1,5 @@
 // ============================================================
 // BLOCKCHAIN/PERSISTENCE — Persistência local da chain em disco
-//
-// Responsabilidades:
-//   - Salvar a chain (blocos + saldos) em JSON no diretório /app/state
-//   - Carregar a chain ao iniciar, evitando recomeçar do zero
-//   - Cada nó usa um arquivo nomeado pelo seu ID (ex: chain_1.json)
-//     para suportar múltiplos brokers na mesma máquina
-//
-// Fluxo de uso:
-//   1. Na inicialização: CarregarChain → se vazio, cria gênesis
-//   2. A cada CommitarBloco bem-sucedido: SalvarChain
-//   3. No encerramento gracioso (SIGTERM): SalvarChain
 // ============================================================
 
 package blockchain
@@ -60,6 +49,11 @@ func (c *Chain) SalvarChain() error {
 	}
 
 	caminho := caminhoArquivo(c.DroneID)
+
+	// 🛡️ Garante que o diretório base existe antes de gravar
+	if err := os.MkdirAll(filepath.Dir(caminho), 0755); err != nil {
+		return fmt.Errorf("erro ao criar diretório de estado: %w", err)
+	}
 
 	tmp := caminho + ".tmp"
 	if err := os.WriteFile(tmp, dados, 0644); err != nil {
@@ -258,7 +252,6 @@ func (c *Chain) CommitarBloco(b Bloco) error {
 
 	c.mu.Unlock() // Libera o lock ANTES de chamar SalvarChain
 
-	// Agora é seguro chamar SalvarChain (que exige o RLock internamente)
 	if err := c.SalvarChain(); err != nil {
 		fmt.Printf("[blockchain %s] AVISO: falha ao persistir após commit do bloco #%d: %v\n",
 			c.DroneID, b.Indice, err)
@@ -351,10 +344,23 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(nova) <= len(c.Blocos) {
+	// 🛡️ Impede regressões, mas abre espaço para desempate
+	if len(nova) < len(c.Blocos) {
 		return false
 	}
 
+	// ⚔️ TIE-BREAKER (Desempate em Fork)
+	if len(nova) == len(c.Blocos) {
+		ultimoLocal := c.Blocos[len(c.Blocos)-1]
+		ultimoRemoto := nova[len(nova)-1]
+
+		// O hash menor vence a disputa lexicograficamente
+		if ultimoLocal.Hash <= ultimoRemoto.Hash {
+			return false
+		}
+	}
+
+	// Validação de integridade da nova Chain
 	for i := 1; i < len(nova); i++ {
 		if nova[i].HashAnterior != nova[i-1].Hash {
 			fmt.Printf("[blockchain %s] Chain recebida inválida no bloco #%d\n", c.DroneID, i)
@@ -368,9 +374,13 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 
 	c.Blocos = nova
 
+	// 🧹 Limpeza completa do mapa de saldos antes de refazer o estado
+	c.Saldos = make(map[string]int)
 	for k, v := range saldosIniciais {
 		c.Saldos[k] = v
 	}
+
+	// Replay financeiro
 	for _, bloco := range nova {
 		if bloco.TipoDados == TipoBloco_Transacao {
 			var tx struct {
@@ -389,7 +399,7 @@ func (c *Chain) SubstituirChain(nova []Bloco, saldosIniciais map[string]int) boo
 		}
 	}
 
-	fmt.Printf("[blockchain %s] Chain substituída por chain com %d blocos\n", c.DroneID, len(nova))
+	fmt.Printf("[blockchain %s] 🔄 Fork Resolvido! Chain sincronizada e desempate concluído (%d blocos)\n", c.DroneID, len(nova))
 
 	go func() {
 		if err := c.SalvarChain(); err != nil {
@@ -442,15 +452,12 @@ func (c *Chain) UltimoBloco() Bloco {
 // SEGURANÇA CONTRA FRAUDES E CONCORRÊNCIA
 // ============================================================
 
-// ObterBlocos retorna uma cópia completa e segura dos blocos armazenados na memória.
-// Fundamental para a auditoria de histórico (defesa contra ataque Salami) 
-// sem travar a cadeia inteira de blocos durante a varredura do histórico.
 func (c *Chain) ObterBlocos() []Bloco {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	copia := make([]Bloco, len(c.Blocos))
 	copy(copia, c.Blocos)
-	
+
 	return copia
 }

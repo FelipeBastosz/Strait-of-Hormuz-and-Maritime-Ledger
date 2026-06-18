@@ -26,7 +26,7 @@ client:
 
 # 5. Acompanha os logs apenas dos Brokers (limpo e direto)
 logs:
-	docker-compose logs -f broker1 broker2 broker3 broker4
+	docker-compose logs -f broker1 broker2 broker3 broker4 broker5
 
 # 6. Derruba a rede e LIMPA OS VOLUMES, zerando a blockchain e os saldos
 down:

@@ -105,6 +105,24 @@ services:
     ports:
       - "0.0.0.0:9084:9084"
     restart: on-failure
+    
+  broker5:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    command: [ "5" ]
+    environment:
+      CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
+      MALICIOUS: "true"  # <--- Ativa o comportamento vilão/hacker
+    volumes:
+      - state-broker5:/app/state
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "0.0.0.0:9185:9085"
+    restart: on-failure
 
   # ==========================================================
   # DRONES — frota compartilhada entre setores

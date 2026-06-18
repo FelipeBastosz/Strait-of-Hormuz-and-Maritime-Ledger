@@ -27,6 +27,7 @@ volumes:
   state-broker2:
   state-broker3:
   state-broker4:
+  state-broker5:
 
 services:
 
@@ -52,7 +53,7 @@ services:
     networks:
       - ormuz-net
     ports:
-      - "0.0.0.0:9081:9081"
+      - "0.0.0.0:9181:9081"
     restart: on-failure
 
   broker2:
@@ -69,7 +70,7 @@ services:
     networks:
       - ormuz-net
     ports:
-      - "0.0.0.0:9082:9082"
+      - "0.0.0.0:9182:9082"
     restart: on-failure
 
   broker3:
@@ -86,7 +87,7 @@ services:
     networks:
       - ormuz-net
     ports:
-      - "0.0.0.0:9083:9083"
+      - "0.0.0.0:9183:9083"
     restart: on-failure
 
   broker4:
@@ -103,7 +104,25 @@ services:
     networks:
       - ormuz-net
     ports:
-      - "0.0.0.0:9084:9084"
+      - "0.0.0.0:9184:9084"
+    restart: on-failure
+
+  broker5:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    command: [ "5" ]
+    environment:
+      CONFIG_PATH: /app/config.json
+      STATE_DIR: /app/state
+      MALICIOUS: "true"  # <--- Ativa o comportamento vilão/hacker
+    volumes:
+      - state-broker5:/app/state
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "0.0.0.0:9185:9085"
     restart: on-failure
 
   # ==========================================================
@@ -178,6 +197,23 @@ services:
       - "9094:9094"
     depends_on:
       - broker4
+    restart: on-failure
+
+  drone5:
+    build:
+      context: .
+      dockerfile: Dockerfile.drone
+    command: [ "drone1", "drone1:9095", "broker1:9085" ]
+    environment:
+      CONFIG_PATH: /app/config.json
+    volumes:
+      - ./config.json:/app/config.json:ro
+    networks:
+      - ormuz-net
+    ports:
+      - "9095:9095"
+    depends_on:
+      - broker1
     restart: on-failure
 
   # ==========================================================
@@ -328,7 +364,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.tester
-    command: ["broker1:9081", "broker2:9082", "broker3:9083", "broker4:9084"]
+    command: ["broker1:9081", "broker2:9082", "broker3:9083", "broker4:9084", "broker5:9085"]
     networks:
       - ormuz-net
     depends_on:
@@ -336,5 +372,6 @@ services:
       - broker2
       - broker3
       - broker4
+      - broker5
     stdin_open: true
     tty: true

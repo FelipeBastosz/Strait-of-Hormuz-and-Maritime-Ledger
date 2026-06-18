@@ -27,6 +27,7 @@ volumes:
   state-broker2:
   state-broker3:
   state-broker4:
+  state-broker5:
 
 services:
 

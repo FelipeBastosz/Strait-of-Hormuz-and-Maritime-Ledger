@@ -11,7 +11,7 @@ services:
   # ── BROKERS (PC 2) ────────────────────────────────────────
   broker3:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.broker
     command: ["3"]
     environment:
@@ -19,7 +19,7 @@ services:
       STATE_DIR: /app/state
     volumes:
       - state-broker3:/app/state
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -28,7 +28,7 @@ services:
 
   broker4:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.broker
     command: ["4"]
     environment:
@@ -36,7 +36,7 @@ services:
       STATE_DIR: /app/state
     volumes:
       - state-broker4:/app/state
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -45,7 +45,7 @@ services:
 
   broker5:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.broker
     command: ["5"]
     environment:
@@ -54,7 +54,7 @@ services:
       MALICIOUS: "true"
     volumes:
       - state-broker5:/app/state
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -64,7 +64,7 @@ services:
   # ── DRONES (PC 2) ─────────────────────────────────────────
   drone3:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.drone
     command: [
       "drone3", "172.16.201.13:9093", 
@@ -74,7 +74,7 @@ services:
     environment:
       CONFIG_PATH: /app/config.json
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -85,7 +85,7 @@ services:
 
   drone4:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.drone
     command: [
       "drone4", "172.16.201.13:9094", 
@@ -95,7 +95,7 @@ services:
     environment:
       CONFIG_PATH: /app/config.json
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -106,7 +106,7 @@ services:
 
   drone5:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.drone
     command: [
       "drone5", "172.16.201.13:9095", 
@@ -116,7 +116,7 @@ services:
     environment:
       CONFIG_PATH: /app/config.json
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -128,7 +128,7 @@ services:
   # ── SENSORES (PC 2) ───────────────────────────────────────
   sensor-s3a:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.sensor
     command: ["S3A", "setor-3", "broker3:9083"]
     environment:
@@ -142,7 +142,7 @@ services:
 
   sensor-s3b:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.sensor
     command: ["S3B", "setor-3", "broker3:9083"]
     environment:
@@ -156,7 +156,7 @@ services:
 
   sensor-s4a:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.sensor
     command: ["S4A", "setor-4", "broker4:9084"]
     environment:
@@ -170,7 +170,7 @@ services:
 
   sensor-s4b:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.sensor
     command: ["S4B", "setor-4", "broker4:9084"]
     environment:
@@ -185,7 +185,7 @@ services:
   # ── FERRAMENTA DE DIAGNÓSTICO (PC 2) ──────────────────────
   tester:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.tester
     command: ["172.16.201.14:9081", "172.16.201.14:9082", "broker3:9083", "broker4:9084", "broker5:9085"]
     networks:

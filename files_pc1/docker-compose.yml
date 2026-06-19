@@ -10,7 +10,7 @@ services:
   # ── BROKERS (PC 1) ────────────────────────────────────────
   broker1:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.broker
     command: ["1"]
     environment:
@@ -18,7 +18,7 @@ services:
       STATE_DIR: /app/state
     volumes:
       - state-broker1:/app/state
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -27,7 +27,7 @@ services:
 
   broker2:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.broker
     command: ["2"]
     environment:
@@ -35,7 +35,7 @@ services:
       STATE_DIR: /app/state
     volumes:
       - state-broker2:/app/state
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -45,9 +45,8 @@ services:
   # ── DRONES (PC 1) ─────────────────────────────────────────
   drone1:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.drone
-    # Conecta no DNS interno do PC 1 e no IP físico do PC 2
     command: [
       "drone1", "172.16.201.14:9091", 
       "broker1:9081", "broker2:9082", 
@@ -56,7 +55,7 @@ services:
     environment:
       CONFIG_PATH: /app/config.json
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -68,7 +67,7 @@ services:
 
   drone2:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.drone
     command: [
       "drone2", "172.16.201.14:9092", 
@@ -78,7 +77,7 @@ services:
     environment:
       CONFIG_PATH: /app/config.json
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ../config.json:/app/config.json:ro
     networks:
       - ormuz-net
     ports:
@@ -89,10 +88,9 @@ services:
     restart: on-failure
 
   # ── SENSORES (PC 1) ───────────────────────────────────────
-  # Sensores são de borda (Edge), só precisam falar com o broker local mais próximo
   sensor-s1a:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.sensor
     command: ["S1A", "setor-1", "broker1:9081"]
     environment:
@@ -106,7 +104,7 @@ services:
 
   sensor-s1b:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.sensor
     command: ["S1B", "setor-1", "broker1:9081"]
     environment:
@@ -120,7 +118,7 @@ services:
 
   sensor-s2a:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.sensor
     command: ["S2A", "setor-2", "broker2:9082"]
     environment:
@@ -134,7 +132,7 @@ services:
 
   sensor-s2b:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.sensor
     command: ["S2B", "setor-2", "broker2:9082"]
     environment:
@@ -149,7 +147,7 @@ services:
   # ── FERRAMENTA DE DIAGNÓSTICO (PC 1) ──────────────────────
   tester:
     build:
-      context: .
+      context: ../
       dockerfile: Dockerfile.tester
     command: [
       "broker1:9081", "broker2:9082", 

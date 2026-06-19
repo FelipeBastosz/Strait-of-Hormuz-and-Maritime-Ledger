@@ -378,8 +378,8 @@ O `broker5` aceita a variável de ambiente `MALICIOUS=true` (já configurada por
 
 ## 👨‍💻 Autores
 
-Felipe Bastos — Desenvolvedor Backend & Estudante de Engenharia de Computação — UEFS
-Daniel — Exclusão mútua, heartbeat e camada de segurança (TLS)
+* **Felipe Bastos Coelho**
+* **Daniel Porto Braz**
 
 ---
 

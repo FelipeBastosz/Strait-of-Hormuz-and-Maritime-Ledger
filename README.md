@@ -142,165 +142,172 @@ Um broker detecta que o `hash_anterior` de um bloco recebido não corresponde ao
 
 ---
 
-## 📂 Estrutura do Projeto
+## 📂 Estrutura do Projeto (Física e Lógica)
 
-```
+A execução do ecossistema agora está segregada por diretórios específicos para espelhar a distribuição em duas máquinas reais:
+
+```text
 Strait-of-Hormuz-and-Maritime-Ledger/
 │
-├── blockchain/         # Ledger: blocos, hash SHA-256, saldos, persistência atômica
+├── files_pc1/                 # Ambiente Host 1 (Brokers 1, 2 e complementos)
+│   ├── docker-compose.yml
+│   └── Makefile
+│
+├── files_pc2/                 # Ambiente Host 2 (Brokers 3, 4, 5 e complementos)
+│   ├── docker-compose.yml
+│   └── Makefile
+│
+├── blockchain/                # Ledger: blocos, hash SHA-256, saldos, persistência atômica
 │   └── blockchain.go
+├── broker/                    # Nó do cluster: RA, heartbeat, TLS, blockchain, despacho
+│   └── broker.go
+├── client/                    # Terminal de comando interativo
+├── drone/                     # Atuador compartilhado entre todos os brokers
+├── protocol/                  # Envelope universal de mensagens + structs de domínio
+├── sensor/                    # Gerador automático de ocorrências por setor
+├── state/                     # Fila de prioridade com Aging + persistência state
+├── tester/                    # Diagnóstico, stress-test e monitor de consenso
 │
-├── broker/              # Nó do cluster: RA, heartbeat, TLS, blockchain, despacho
-│   ├── broker.go
-│   ├── cert.pem
-│   └── key.pem
-│
-├── client/              # Terminal de comando interativo
-│   └── client.go
-│
-├── drone/               # Atuador compartilhado entre todos os brokers
-│   └── drone.go
-│
-├── protocol/            # Envelope universal de mensagens + structs de domínio
-│   └── protocol.go
-│
-├── sensor/              # Gerador automático de ocorrências por setor
-│   └── sensor.go
-│
-├── state/               # Fila de prioridade com Aging + snapshot de estado
-│   ├── persistence.go
-│   └── state.go
-│
-├── tester/              # Diagnóstico, stress-test e monitor de consenso
-│   └── tester.go
-│
-├── Docs/                 # Diagramas de sequência da arquitetura
-│
-├── config.json          # Mapa de rede do cluster (ID do broker → endereço)
-├── docker-compose.yml
-├── Dockerfile.broker
-├── Dockerfile.client
-├── Dockerfile.drone
-├── Dockerfile.sensor
-├── Dockerfile.tester
-├── gen-certs.sh          # Gerador de certificado TLS auto-assinado
-├── go.mod
-├── Makefile
-└── LICENSE
-```
-
+├── Docs/                      # Diagramas de arquitetura
+├── config.json                # Mapa de rede do cluster
+├── gen-certs.sh               # Gerador de certificado TLS
+└── Dockerfile.* # Dockerfiles de todos os serviços
 ---
 
 ## ⚙️ Configuração da Rede (`config.json`)
 
-O arquivo `config.json` mapeia o ID de cada broker ao seu endereço TCP, montado como volume somente-leitura em todos os contêineres que precisam conhecer a topologia da rede:
+O arquivo `config.json` mapeia o ID de cada broker ao seu respectivo endereço IP/DNS. Esse arquivo é montado como volume na raiz da configuração e é utilizado por todos os componentes para localizar os brokers da rede.
 
 ```json
 {
-  "1": "broker1:9081",
-  "2": "broker2:9082",
-  "3": "broker3:9083",
-  "4": "broker4:9084",
-  "5": "broker5:9085"
+  "1": "172.16.201.14:9081",
+  "2": "172.16.201.14:9082",
+  "3": "172.16.201.13:9083",
+  "4": "172.16.201.13:9084",
+  "5": "172.16.201.13:9085"
 }
 ```
 
 ### Mapa de Companhias por Broker
 
-Cada broker administra um grupo fixo de países, agrupados por continente/região. Todos iniciam com **100 créditos**.
-
-| Broker | Setor | Países |
-|---|---|---|
-| broker1 | Europa | Alemanha, França, Itália, Inglaterra |
-| broker2 | Ásia / Oriente Médio | China, Japão, Índia, Emirados |
-| broker3 | Américas | EUA, Canadá, Brasil, Argentina |
-| broker4 | África | Egito, Somália, Djibuti, África do Sul |
-| broker5 | Oceania / Sudeste Asiático (**nó malicioso de teste**) | Austrália, Nova Zelândia, Indonésia, Filipinas |
+| Host | Broker | Setor | Países |
+|------|--------|--------|---------|
+| PC 1 | broker1 | Europa | Alemanha, França, Itália, Inglaterra |
+| PC 1 | broker2 | Ásia / Oriente Médio | China, Japão, Índia, Emirados |
+| PC 2 | broker3 | Américas | EUA, Canadá, Brasil, Argentina |
+| PC 2 | broker4 | África | Egito, Somália, Djibuti, África do Sul |
+| PC 2 | broker5 | Oceania / Sudeste Asiático *(nó malicioso)* | Austrália, Nova Zelândia, Indonésia, Filipinas |
 
 ---
 
 ## 💰 Sistema de Créditos
 
 | Regra | Valor |
-|---|---|
-| Saldo inicial por país | 100 créditos |
-| Custo de uma escolta de drone | 10 créditos |
-| Recompensa por renovação de Ricart-Agrawala | até 5 créditos |
-| Limite de recarga automática | acionada quando o saldo < 20 |
-| Valor da recarga protocolar | 100 créditos |
+|--------|------:|
+| Saldo inicial por país | **100 créditos** |
+| Custo de uma escolta de drone | **10 créditos** |
+| Recompensa por renovação de Ricart-Agrawala | **até 5 créditos** |
+| Limite para recarga automática | **Saldo < 20 créditos** |
+| Valor da recarga protocolar | **100 créditos** |
 
-O saldo só é debitado depois que o **bloco de transação** correspondente é aprovado pelo consenso PoA (maioria dos brokers vivos) — o drone permanece em "mempool" até essa confirmação chegar.
+> **Importante:** o saldo somente é debitado após o bloco da transação ser aprovado pelo consenso **Proof of Authority (PoA)** (maioria dos brokers vivos). Até essa confirmação, a solicitação do drone permanece na **mempool**.
 
 ---
 
 ## 🛠️ Pré-requisitos
 
-- Docker + Docker Compose
-- OpenSSL (para gerar os certificados TLS)
+Antes de executar o sistema, certifique-se de possuir:
 
-## 🐳 Configuração e Execução
+- Docker e Docker Compose instalados em ambos os hosts (PC 1 e PC 2);
+- Conectividade de rede entre as máquinas (ex.: `172.16.201.14` e `172.16.201.13`);
+- OpenSSL instalado para geração dos certificados TLS.
+
+---
+
+# 🐳 Configuração e Execução
+
+## Passo 1 — Geração dos Certificados
+
+No computador primário, gere as chaves criptográficas **apenas uma vez**. Certifique-se de que os arquivos `cert.pem` e `key.pem` também sejam copiados para o código que será executado no PC 2.
 
 ```bash
-# 1. Gera os certificados TLS (apenas uma vez)
 chmod +x gen-certs.sh
 ./gen-certs.sh
-
-# 2. Sobe o cluster completo (5 brokers, 5 drones, 8 sensores, client e tester)
-docker-compose up --build
-```
-
-### Encerrar o sistema
-
-```bash
-docker-compose down
-```
-
-Para encerrar **e apagar os volumes de persistência** (zera blockchain e saldos):
-
-```bash
-docker-compose down -v
-```
-
-### Atalhos via Makefile
-
-```bash
-make up-test   # Sobe só brokers + drones + client + tester (sensores OFF, ideal para depurar)
-make up-full   # Sobe o ecossistema completo, com os 8 sensores em modo caótico
-make tester    # Acessa o terminal do tester interativo
-make client    # Acessa o terminal do cliente interativo
-make logs      # Acompanha os logs de todos os brokers
-make down      # Derruba a rede e limpa os volumes de estado
-```
-
-### Comandos úteis de monitoramento
-
-```bash
-docker ps                          # Lista os containers ativos
-docker-compose logs -f             # Acompanha logs de toda a rede
-docker logs -f <nome_do_container> # Logs de um container específico
-docker stop <nome_do_container>    # Testa tolerância a falhas (derruba um broker)
-docker restart <nome_do_container> # Reinicia e dispara a recuperação de estado
 ```
 
 ---
 
-## 💻 Terminal de Comando (Cliente)
+## Passo 2 — Execução no PC 1 (`172.16.201.14`)
+
+Entre no diretório correspondente e inicialize o primeiro host.
 
 ```bash
-docker attach $(docker-compose ps -q client)
+cd files_pc1
+make up-full
 ```
 
-O cliente injeta ocorrências manualmente, em nome de uma companhia escolhida:
+---
 
+## Passo 3 — Execução no PC 2 (`172.16.201.13`)
+
+No segundo computador, execute:
+
+```bash
+cd files_pc2
+make up-full
 ```
+
+---
+
+## Comandos do Makefile
+
+Execute dentro do respectivo diretório (`files_pc1` ou `files_pc2`).
+
+```bash
+make up-test   # Brokers + drones + client + tester (sensores desligados)
+make up-full   # Ecossistema completo (incluindo sensores)
+make tester    # Terminal de estresse do Tester
+make client    # Terminal do Client
+make logs      # Acompanha logs principais
+make down      # Encerra o cluster local e remove blockchain/saldos persistidos
+```
+
+> **Observação:** `make down` remove o volume `/state`. Na próxima inicialização, o cluster começará uma nova blockchain contendo apenas o **Bloco Gênesis**.
+
+---
+
+# 💻 Terminal de Comando (Cliente)
+
+Para inserir ocorrências manualmente no sistema (normalmente a partir do **PC 1**):
+
+```bash
+cd files_pc1
+make client
+```
+
+Exemplo de utilização:
+
+```text
 ==================================================
    Terminal de Comando — Estreito de Ormuz P3
 ==================================================
-Companhia ativa: companhia-a
-Comandos: [1] Enviar ocorrência  [2] Consultar saldo  [3] Trocar companhia  [sair]
+
+Companhia ativa: b1-alemanha
+
+Comandos:
+[1] Enviar ocorrência
+[2] Consultar saldo
+[3] Trocar companhia
+[sair]
+
 > 1
-Descrição da ocorrência (ou 'sair'): Embarcação suspeita no canal norte
-Prioridade (1=Aviso, 2=Alerta, 3=Crítico): 3
+
+Descrição da ocorrência (ou 'sair'):
+Navio pirata interceptado
+
+Prioridade (1=Aviso, 2=Alerta, 3=Crítico):
+3
+
 ✅ Ocorrência CLI-host-OC0001 aceita pelo broker!
 ```
 
